@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE library SYSTEM "library.dtd">
+<library name="usbaudio" basename="USBAudioBase" openname="usbaudio.audio">
+	<include>exec/types.h</include>
+	<include>libraries/ahi_sub.h</include>
+
+	<interface name="main" version="1.0" struct="USBAudioIFace" prefix="_usbaudio_" asmprefix="IUSBAudio" global="IUSBAudio">
+		<method name="Obtain" result="uint32"/>
+		<method name="Release" result="uint32"/>
+		<method name="Expunge" result="void" status="unimplemented"/>
+		<method name="Clone" result="struct USBAudioIFace *"/>
+		<method name="AHIsub_AllocAudio" result="uint32">
+			<arg name="tagList" type="struct TagItem *"/>
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+		</method>
+		<method name="AHIsub_FreeAudio" result="void">
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+		</method>
+		<method name="AHIsub_Disable" result="void">
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+		</method>
+		<method name="AHIsub_Enable" result="void">
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+		</method>
+		<method name="AHIsub_Start" result="uint32">
+			<arg name="Flags" type="uint32"/>
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+		</method>
+		<method name="AHIsub_Stop" result="uint32">
+			<arg name="Flags" type="uint32"/>
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+		</method>
+		<method name="AHIsub_Update" result="uint32">
+			<arg name="Flags" type="uint32"/>
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+		</method>
+		<method name="AHIsub_SetVol" result="uint32">
+			<arg name="Channel" type="uint16"/>
+			<arg name="Volume" type="Fixed"/>
+			<arg name="Pan" type="sposition"/>
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+			<arg name="Flags" type="uint32"/>
+		</method>
+		<method name="AHIsub_SetFreq" result="uint32">
+			<arg name="Channel" type="uint16"/>
+			<arg name="Freq" type="uint32"/>
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+			<arg name="Flags" type="uint32"/>
+		</method>
+		<method name="AHIsub_SetSound" result="uint32">
+			<arg name="Channel" type="uint16"/>
+			<arg name="Sound" type="uint16"/>
+			<arg name="Offset" type="uint32"/>
+			<arg name="Lenght" type="int32"/>
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+			<arg name="Flags" type="uint32"/>
+		</method>
+		<method name="AHIsub_SetEffect" result="uint32">
+			<arg name="Effect" type="APTR"/>
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+		</method>
+		<method name="AHIsub_LoadSound" result="uint32">
+			<arg name="Sound" type="uint16"/>
+			<arg name="Type" type="uint32"/>
+			<arg name="Info" type="APTR"/>
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+		</method>
+		<method name="AHIsub_UnloadSound" result="uint32">
+			<arg name="Sound" type="uint16"/>
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+		</method>
+		<method name="AHIsub_GetAttr" result="int32">
+			<arg name="Attribute" type="uint32"/>
+			<arg name="Argument" type="int32"/>
+			<arg name="DefValue" type="int32"/>
+			<arg name="tagList" type="struct TagItem *"/>
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+		</method>
+		<method name="AHIsub_HardwareControl" result="int32">
+			<arg name="Attribute" type="uint32"/>
+			<arg name="Argument" type="int32"/>
+			<arg name="AudioCtrl" type="struct AHIAudioCtrlDrv *"/>
+		</method>
+	</interface>
+</library>
