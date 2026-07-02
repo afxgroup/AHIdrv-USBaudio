@@ -255,7 +255,11 @@ static void enumerate_device_modes(libusb_device *usbdev,
                                    struct USBAudioDeviceInfo *dev)
 {
     libusb_device_handle *handle = NULL;
-    uint8 buf[1024];
+    /* USB Audio descriptors can be large (PCM2902 with 6 alt-settings is ~1600
+     * bytes).  Use a heap buffer so we don't blow the stack and so we can
+     * handle any device up to 8 KB without recompiling. */
+    #define ENUM_BUF_SIZE 8192
+    uint8 *buf = NULL;
     int32 r, pos;
     int32 current_ifc = -1, current_alt = -1;
     int32 current_class = 0, current_subclass = 0;
@@ -273,6 +277,10 @@ static void enumerate_device_modes(libusb_device *usbdev,
     uint8 su_sources[MAX_INPUT_SOURCES];
     uint8 su_num_pins = 0;
 
+    /* Output Terminal tracking: non-USB-Streaming OTs are physical outputs */
+    struct { uint8 id; uint16 type; } enum_ot[8];
+    int32 n_ot = 0;
+
     /* Current alt-setting's format info (reset on each new Interface desc) */
     int32 cur_ch = 0, cur_sub = 0, cur_bits = 0, cur_valid = 0;
     uint32 cur_freq[MAX_USB_FREQUENCIES];
@@ -285,6 +293,8 @@ static void enumerate_device_modes(libusb_device *usbdev,
     uint8  best_play_sub  = 0, best_play_bits = 0;
     uint32 best_play_freq[MAX_USB_FREQUENCIES];
     int32  best_play_nfreq = 0;
+    int32  best_play_rate_ctrl = 0; /* from CS_ENDPOINT bmAttributes D0 */
+    int32  last_was_play_ep    = 0; /* set when we just updated best_play_* */
 
     dev->num_outputs     = 0;
     dev->num_inputs      = 0;
@@ -311,25 +321,39 @@ static void enumerate_device_modes(libusb_device *usbdev,
         return;
     }
 
+    buf = IExec->AllocVecTags(ENUM_BUF_SIZE, AVT_Type, MEMF_SHARED, TAG_END);
+    if (buf == NULL)
+    {
+        DPRINTF("[USBAudio] enumerate: out of memory\n");
+        ILibusb1->libusb_close(handle);
+        return;
+    }
+
     /* Read config descriptor header for total length */
     r = ILibusb1->libusb_control_transfer(handle,
             0x80, 0x06, (0x02 << 8) | 0, 0, buf, 9, 5000);
     if (r < 9)
     {
         DPRINTF("[USBAudio] enumerate: config header failed (%ld)\n", r);
+        IExec->FreeVec(buf);
         ILibusb1->libusb_close(handle);
         return;
     }
 
     total_len = (uint16)(buf[2] | (buf[3] << 8));
-    if (total_len > sizeof(buf))
-        total_len = (uint16)sizeof(buf);
+    if (total_len > ENUM_BUF_SIZE)
+    {
+        DPRINTF("[USBAudio] enumerate: WARNING: config descriptor too large (%ld > %ld), truncating!\n",
+                           (LONG)total_len, (LONG)ENUM_BUF_SIZE);
+        total_len = ENUM_BUF_SIZE;
+    }
 
     r = ILibusb1->libusb_control_transfer(handle,
             0x80, 0x06, (0x02 << 8) | 0, 0, buf, total_len, 5000);
     if (r < 9)
     {
         DPRINTF("[USBAudio] enumerate: full config read failed (%ld)\n", r);
+        IExec->FreeVec(buf);
         ILibusb1->libusb_close(handle);
         return;
     }
@@ -365,6 +389,7 @@ static void enumerate_device_modes(libusb_device *usbdev,
             current_class    = buf[pos + 5];
             current_subclass = buf[pos + 6];
             cur_valid = 0;  /* Reset format tracker for new alt */
+            last_was_play_ep = 0;  /* No pending CS_ENDPOINT from previous alt */
         }
         /* ---- CS_INTERFACE: Input Terminal (Audio Control) ---- */
         else if (dsc_type == 0x24 && dsc_len >= 12 &&
@@ -441,8 +466,12 @@ static void enumerate_device_modes(libusb_device *usbdev,
 
             for (pi = 0; pi < nr_pins && pi < MAX_INPUT_SOURCES; pi++)
             {
-                if (pos + 5 + pi < total_len)
-                    su_sources[pi] = buf[pos + 5 + pi];
+                /* Only count a pin if its source byte is actually present in
+                 * the descriptor — otherwise su_sources[pi] would stay
+                 * uninitialized yet be treated as a valid source below. */
+                if (pos + 5 + pi >= total_len)
+                    break;
+                su_sources[pi] = buf[pos + 5 + pi];
                 su_num_pins++;
             }
 
@@ -452,6 +481,21 @@ static void enumerate_device_modes(libusb_device *usbdev,
                 DPRINTF("%ld%s", (LONG)su_sources[pi],
                                    pi < su_num_pins - 1 ? "," : "");
             DPRINTF("]\n");
+        }
+        /* ---- CS_INTERFACE: Output Terminal (Audio Control) ---- */
+        else if (dsc_type == 0x24 && dsc_len >= 9 &&
+                 buf[pos + 2] == 0x03 &&
+                 current_class == 0x01 && current_subclass == 0x01)
+        {
+            uint16 otype = (uint16)(buf[pos + 4] | (buf[pos + 5] << 8));
+
+            /* Non-USB-Streaming OTs are physical output destinations */
+            if (otype != 0x0101 && n_ot < 8)
+            {
+                enum_ot[n_ot].id   = buf[pos + 3];
+                enum_ot[n_ot].type = otype;
+                n_ot++;
+            }
         }
         /* ---- CS_INTERFACE: Format Type I ---- */
         else if (dsc_type == 0x24 && dsc_len >= 8 &&
@@ -530,12 +574,15 @@ static void enumerate_device_modes(libusb_device *usbdev,
                         for (fi = 0; fi < cur_nfreq && fi < MAX_USB_FREQUENCIES; fi++)
                             best_play_freq[fi] = cur_freq[fi];
                     }
+                    best_play_rate_ctrl = 0;  /* updated by the CS_ENDPOINT that follows */
+                    last_was_play_ep    = 1;
                     DPRINTF("[USBAudio] enumerate: best play so far: %ldch alt=%ld ep=0x%02lx maxpkt=%ld\n",
                                        (LONG)cur_ch, (LONG)current_alt,
                                        (LONG)ep_addr, (LONG)ep_maxpkt);
                 }
                 else
                 {
+                    last_was_play_ep = 0;
                     DPRINTF("[USBAudio] enumerate: skipping %ldch alt=%ld (best=%ldch)\n",
                                        (LONG)cur_ch, (LONG)current_alt,
                                        (LONG)best_play_ch);
@@ -569,6 +616,21 @@ static void enumerate_device_modes(libusb_device *usbdev,
                                    (LONG)dev->rec_nr_channels, (LONG)dev->rec_max_pkt);
             }
         }
+        /* ---- CS_ENDPOINT EP_GENERAL (Class-Specific AS Endpoint) ----
+         * Immediately follows the Standard Endpoint descriptor (USB Audio
+         * Class 1.0 §3.7.2).  bmAttributes bit D0 = Sampling Frequency
+         * Control supported.  If D0=0 the device will always STALL a
+         * SET_CUR SAMPLING_FREQ_CONTROL request. */
+        else if (dsc_type == 0x25 && dsc_len >= 7 && buf[pos + 2] == 0x01)
+        {
+            if (last_was_play_ep)
+            {
+                best_play_rate_ctrl = buf[pos + 3] & 0x01;
+                DPRINTF("[USBAudio] enumerate: CS_ENDPOINT bmAttributes=0x%02lx -> rate_ctrl=%ld\n",
+                                   (ULONG)buf[pos + 3], (LONG)best_play_rate_ctrl);
+            }
+            last_was_play_ep = 0;
+        }
 
         pos += dsc_len;
     }
@@ -576,60 +638,137 @@ static void enumerate_device_modes(libusb_device *usbdev,
     /* ---- Generate output entries from best playback alt setting ---- */
     if (best_play_ch >= 2)
     {
-        /* Channel pair names for surround configurations.
-         * USB Audio Class 1.0 channel order (8ch):
-         *   ch0=Front L, ch1=Front R,
-         *   ch2=Center,  ch3=LFE,
-         *   ch4=Back L,  ch5=Back R,
-         *   ch6=Side L,  ch7=Side R */
-        static const struct { const char *name; uint8 offset; } pair_map[] = {
-            { "Front",      0 },
-            { "Center/LFE", 2 },
-            { "Back",       4 },
-            { "Side",       6 },
-        };
-        int32 n_pairs = best_play_ch / 2;
-        int32 pi;
-
-        if (n_pairs > 4) n_pairs = 4;
-        if (n_pairs > MAX_OUTPUT_MODES) n_pairs = MAX_OUTPUT_MODES;
-
-        for (pi = 0; pi < n_pairs; pi++)
+        if (n_ot > 0 && best_play_ch == 2)
         {
-            struct USBOutputMode *out = &dev->outputs[pi];
-            const char *mname;
-            int32 k, fi;
+            /* Simple stereo device with named Output Terminals.
+             * Expose each physical destination (e.g. Line Out, Headphone)
+             * as a separate selectable AHI output entry.
+             * All share the same USB endpoint — the AHI output selector
+             * is cosmetic but shows the user the physical connectors. */
+            static const struct { uint16 type; const char *name; } ot_names[] = {
+                { 0x0301, "Speaker"      },
+                { 0x0302, "Headphone"    },
+                { 0x0303, "HMD Audio"    },
+                { 0x0304, "Desktop Spkr" },
+                { 0x0401, "Handset"      },
+                { 0x0402, "Headset"      },
+                { 0x0403, "Speakerphone" },
+                { 0x0601, "Analog Out"   },
+                { 0x0603, "Line Out"     },
+                { 0x0604, "Legacy Out"   },
+                { 0x0605, "SPDIF Out"    },
+            };
+            int32 n_to_add = n_ot;
+            int32 oi;
 
-            out->iface_num      = best_play_ifc;
-            out->alt_setting    = best_play_alt;
-            out->ep_addr        = best_play_ep;
-            out->max_pkt        = best_play_pkt;
-            out->nr_channels    = (uint8)best_play_ch;
-            out->subframe_size  = best_play_sub;
-            out->bit_resolution = best_play_bits;
-            out->channel_offset = pair_map[pi].offset;
-            out->num_frequencies = best_play_nfreq;
-            for (fi = 0; fi < best_play_nfreq && fi < MAX_USB_FREQUENCIES; fi++)
-                out->frequencies[fi] = best_play_freq[fi];
+            if (n_to_add > MAX_OUTPUT_MODES) n_to_add = MAX_OUTPUT_MODES;
 
-            mname = pair_map[pi].name;
-            for (k = 0; mname[k] && k < 47; k++)
-                out->name[k] = mname[k];
-            out->name[k] = '\0';
+            for (oi = 0; oi < n_to_add; oi++)
+            {
+                struct USBOutputMode *out = &dev->outputs[oi];
+                const char *oname = "Audio Out";
+                int32 k, fi, ni;
 
-            DPRINTF("[USBAudio] enumerate: output #%ld \"%s\" alt=%ld ep=0x%02lx ch=%ld offset=%ld maxpkt=%ld\n",
-                               (LONG)pi, out->name,
-                               (LONG)out->alt_setting, (LONG)out->ep_addr,
-                               (LONG)out->nr_channels, (LONG)out->channel_offset,
-                               (LONG)out->max_pkt);
+                out->iface_num      = best_play_ifc;
+                out->alt_setting    = best_play_alt;
+                out->ep_addr        = best_play_ep;
+                out->max_pkt        = best_play_pkt;
+                out->nr_channels    = (uint8)best_play_ch;
+                out->subframe_size  = best_play_sub;
+                out->bit_resolution = best_play_bits;
+                out->channel_offset = 0;
+                out->num_frequencies = best_play_nfreq;
+                out->rate_ctrl      = (uint8)best_play_rate_ctrl;
+                for (fi = 0; fi < best_play_nfreq && fi < MAX_USB_FREQUENCIES; fi++)
+                    out->frequencies[fi] = best_play_freq[fi];
+
+                for (ni = 0; ni < (int32)(sizeof(ot_names)/sizeof(ot_names[0])); ni++)
+                    if (ot_names[ni].type == enum_ot[oi].type)
+                        { oname = ot_names[ni].name; break; }
+
+                for (k = 0; oname[k] && k < 47; k++)
+                    out->name[k] = oname[k];
+                out->name[k] = '\0';
+
+                DPRINTF("[USBAudio] enumerate: output #%ld \"%s\" (OT type=0x%04lx) alt=%ld ep=0x%02lx ch=%ld\n",
+                                   (LONG)oi, out->name, (ULONG)enum_ot[oi].type,
+                                   (LONG)out->alt_setting, (LONG)out->ep_addr,
+                                   (LONG)out->nr_channels);
+            }
+            dev->num_outputs = n_to_add;
         }
-        dev->num_outputs = n_pairs;
+        else
+        {
+            /* Multichannel device or no explicit OTs: channel-pair approach
+             * so surround devices get Front/Rear/Center-LFE/Side entries.
+             * USB Audio Class 1.0 channel order (8ch):
+             *   ch0=Front L, ch1=Front R,
+             *   ch2=Center,  ch3=LFE,
+             *   ch4=Back L,  ch5=Back R,
+             *   ch6=Side L,  ch7=Side R */
+            static const struct { const char *name; uint8 offset; } pair_map[] = {
+                { "Front",      0 },
+                { "Center/LFE", 2 },
+                { "Back",       4 },
+                { "Side",       6 },
+            };
+            int32 n_pairs = best_play_ch / 2;
+            int32 pi;
+
+            if (n_pairs > 4) n_pairs = 4;
+            if (n_pairs > MAX_OUTPUT_MODES) n_pairs = MAX_OUTPUT_MODES;
+
+            for (pi = 0; pi < n_pairs; pi++)
+            {
+                struct USBOutputMode *out = &dev->outputs[pi];
+                const char *mname;
+                int32 k, fi;
+
+                out->iface_num      = best_play_ifc;
+                out->alt_setting    = best_play_alt;
+                out->ep_addr        = best_play_ep;
+                out->max_pkt        = best_play_pkt;
+                out->nr_channels    = (uint8)best_play_ch;
+                out->subframe_size  = best_play_sub;
+                out->bit_resolution = best_play_bits;
+                out->channel_offset = pair_map[pi].offset;
+                out->num_frequencies = best_play_nfreq;
+                out->rate_ctrl      = (uint8)best_play_rate_ctrl;
+                for (fi = 0; fi < best_play_nfreq && fi < MAX_USB_FREQUENCIES; fi++)
+                    out->frequencies[fi] = best_play_freq[fi];
+
+                mname = pair_map[pi].name;
+                for (k = 0; mname[k] && k < 47; k++)
+                    out->name[k] = mname[k];
+                out->name[k] = '\0';
+
+                DPRINTF("[USBAudio] enumerate: output #%ld \"%s\" alt=%ld ep=0x%02lx ch=%ld offset=%ld maxpkt=%ld\n",
+                                   (LONG)pi, out->name,
+                                   (LONG)out->alt_setting, (LONG)out->ep_addr,
+                                   (LONG)out->nr_channels, (LONG)out->channel_offset,
+                                   (LONG)out->max_pkt);
+            }
+            dev->num_outputs = n_pairs;
+        }
     }
 
     /* ---- Resolve Feature Unit topology ---- */
     dev->ac_iface_num = enum_ac_iface;
     {
         int32 ii, fi, ti;
+
+        /* Dump full topology for diagnostics */
+        DPRINTF("[USBAudio] enumerate: topology: %ld IT(s), %ld FU(s), %ld OT(s)\n",
+                           (LONG)n_it, (LONG)n_fu, (LONG)n_ot);
+        for (ti = 0; ti < n_it; ti++)
+            DPRINTF("[USBAudio] enumerate:   IT id=%ld type=0x%04lx\n",
+                               (LONG)enum_it[ti].id, (ULONG)enum_it[ti].type);
+        for (fi = 0; fi < n_fu; fi++)
+            DPRINTF("[USBAudio] enumerate:   FU id=%ld src=%ld\n",
+                               (LONG)enum_fu[fi].id, (LONG)enum_fu[fi].src);
+        for (ti = 0; ti < n_ot; ti++)
+            DPRINTF("[USBAudio] enumerate:   OT id=%ld type=0x%04lx\n",
+                               (LONG)enum_ot[ti].id, (ULONG)enum_ot[ti].type);
 
         /* Match FUs to input sources */
         for (ii = 0; ii < dev->num_inputs; ii++)
@@ -666,19 +805,26 @@ static void enumerate_device_modes(libusb_device *usbdev,
             if (dev->fu_found) break;
         }
 
-        /* Find recording FU (source = Mic/Line, type 0x02xx) */
+        /* Find recording FU: source = any non-USB-Streaming IT.
+         * Covers Microphone (0x02xx), Line In (0x0603), S/PDIF In (0x0605),
+         * and any other physical input besides the USB playback stream.
+         * Skip the FU already claimed as output FU to avoid double-use. */
         dev->fu_rec_found = 0;
         for (fi = 0; fi < n_fu; fi++)
         {
+            /* Don't reuse the output FU */
+            if (dev->fu_found && enum_fu[fi].id == dev->fu_unit_id)
+                continue;
+
             for (ti = 0; ti < n_it; ti++)
             {
                 if (enum_it[ti].id == enum_fu[fi].src &&
-                    (enum_it[ti].type & 0xFF00) == 0x0200)
+                    enum_it[ti].type != 0x0101)  /* any non-USB-Streaming input */
                 {
                     dev->fu_rec_found   = 1;
                     dev->fu_rec_unit_id = enum_fu[fi].id;
-                    DPRINTF("[USBAudio] enumerate: rec FU ID=%ld (Mic/Line)\n",
-                                       (LONG)enum_fu[fi].id);
+                    DPRINTF("[USBAudio] enumerate: rec FU ID=%ld (IT type=0x%04lx)\n",
+                                       (LONG)enum_fu[fi].id, (ULONG)enum_it[ti].type);
                     break;
                 }
             }
@@ -761,6 +907,7 @@ static void enumerate_device_modes(libusb_device *usbdev,
                        (LONG)dev->num_outputs, (LONG)dev->num_inputs,
                        (LONG)dev->selected_output);
 
+    IExec->FreeVec(buf);
     ILibusb1->libusb_close(handle);
 }
 
@@ -1514,6 +1661,7 @@ static void discover_usb_audio_details(struct AHIAudioCtrlDrv *AudioCtrl)
         dd->ua_SubframeSize  = sel->subframe_size;
         dd->ua_BitResolution = sel->bit_resolution;
         dd->ua_ChannelOffset = sel->channel_offset;
+        dd->ua_RateCtrl      = sel->rate_ctrl;
 
         /* Update global frequency list */
         g_usb_info.num_frequencies = sel->num_frequencies;
@@ -1793,7 +1941,41 @@ uint32 _usbaudio_AHIsub_AllocAudio(struct USBAudioIFace    *Self,
 
     alloc_fail_count = 0;  /* Reset on success */
 
-    /* Allocate per-instance driver data */
+    /* ---- Validate requested AudioID against the detected hardware ----
+     *
+     * When AHI's mode database is built (via AddAudioModes or
+     * AHI_AddAudioMode), AHI calls AllocAudio for each mode with a
+     * tagList that may contain either AHIA_AudioID (application tag,
+     * TAG_USER+1) or AHIDB_AudioID (database tag, TAG_USER+100).
+     * We check both so the filter fires regardless of which tag AHI uses.
+     *
+     * AudioID map (see gen_modefile.c):
+     *   0x00550001 — HiFi 16-bit stereo++      (all devices)
+     *   0x00550002 — HiFi 16-bit multichannel++ (devices with ≥4 channels)
+     *   0x00550003 — 16-bit stereo             (all devices)
+     */
+    {
+        /* Read AudioID: AHI may pass it as AHIA_AudioID (app tag) or          *
+         * AHIDB_AudioID (database tag) depending on the call path.            */
+        uint32 req_id = IUtility->GetTagData(AHIA_AudioID,  0, tagList);
+        if (req_id == 0)
+            req_id = IUtility->GetTagData(AHIDB_AudioID, 0, tagList);
+
+        if (req_id == 0x00550002)
+        {
+            /* Multichannel mode: require at least 4 physical output channels */
+            int32 max_ch = (int32)g_usb_info.nr_channels;  /* fallback: basic scan */
+            if (g_usb_info.num_outputs > 0)
+                max_ch = (int32)g_usb_info.outputs[0].nr_channels;
+            if (max_ch < 4)
+            {
+                DPRINTF("[USBAudio] AllocAudio: reject AudioID 0x%08lx "
+                                   "(multichannel needs >=4ch, device has %ld)\n",
+                                   (ULONG)req_id, (LONG)max_ch);
+                return AHISF_ERROR;
+            }
+        }
+    }
     dd = IExec->AllocVecTags((uint32)sizeof(struct USBAudioData),
                              AVT_Type,           MEMF_SHARED,
                              AVT_Lock,           TRUE,
@@ -1876,9 +2058,42 @@ uint32 _usbaudio_AHIsub_AllocAudio(struct USBAudioIFace    *Self,
     dd->ua_Output        = 0;
     dd->ua_RecSlaveSignal = -1;
 
-    DPRINTF("[USBAudio] AHIsub_AllocAudio: OK, VID=0x%04lx PID=0x%04lx\n",
-                       (ULONG)dd->ua_VendorID, (ULONG)dd->ua_ProductID);
-    return (uint32)(AHISF_KNOWHIFI | AHISF_KNOWSTEREO | AHISF_KNOWMULTICHANNEL | AHISF_MIXING | AHISF_TIMING);
+    /* --- Snap ahiac_MixFreq to the closest device-supported rate -----
+     * AHI passes whatever the application requested (e.g. 11025 Hz).
+     * USB Audio devices only decode data at their native rate(s).
+     * Sending 11025 Hz data to a 44100 Hz DAC starves its buffer
+     * and produces silence, even though USB transfers complete fine.
+     * By writing the snapped value here, AHI's internal mixer will
+     * generate PCM at that rate, SET_CUR will use a valid rate, and
+     * the PlaySlave will send the correct byte density to the device. */
+    if (g_usb_info.num_frequencies > 0 && AudioCtrl->ahiac_MixFreq > 0)
+    {
+        uint32 req   = (uint32)AudioCtrl->ahiac_MixFreq;
+        uint32 best  = g_usb_info.frequencies[0];
+        uint32 bestd = (req > best) ? (req - best) : (best - req);
+        int32  fi;
+
+        for (fi = 1; fi < g_usb_info.num_frequencies; fi++)
+        {
+            uint32 d = (req > g_usb_info.frequencies[fi]) ?
+                       (req - g_usb_info.frequencies[fi]) :
+                       (g_usb_info.frequencies[fi] - req);
+            if (d < bestd) { bestd = d; best = g_usb_info.frequencies[fi]; }
+        }
+
+        if (best != req)
+        {
+            DPRINTF("[USBAudio] AllocAudio: snapping MixFreq %lu -> %lu Hz "
+                               "(device supported)\n", (ULONG)req, (ULONG)best);
+            AudioCtrl->ahiac_MixFreq = (ULONG)best;
+        }
+    }
+
+    DPRINTF("[USBAudio] AHIsub_AllocAudio: OK, VID=0x%04lx PID=0x%04lx%s\n",
+                       (ULONG)dd->ua_VendorID, (ULONG)dd->ua_ProductID,
+                       g_usb_info.rec_found ? " (can record)" : "");
+    return (uint32)(AHISF_KNOWHIFI | AHISF_KNOWSTEREO | AHISF_KNOWMULTICHANNEL | AHISF_MIXING | AHISF_TIMING |
+                    (g_usb_info.rec_found ? AHISF_CANRECORD : 0));
 }
 
 
@@ -2122,7 +2337,15 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
         /* ---------- 5. Set sample rate on the endpoint ---------- */
         /* USB Audio Class 1.0: SET_CUR on SAMPLING_FREQ_CONTROL.
          * Without this the device may run at an undefined rate,
-         * producing noise or wrong-pitch audio. */
+         * producing noise or wrong-pitch audio.
+         * Only send if the CS_ENDPOINT descriptor declared D0=1
+         * (Sampling Frequency Control supported).  Devices with D0=0
+         * will always STALL this request per USB Audio Class 1.0 §5.2.3. */
+        if (!dd->ua_RateCtrl)
+        {
+            DPRINTF("[USBAudio] Start: device does not declare sampling freq control (CS_ENDPOINT D0=0), skipping SET_CUR\n");
+        }
+        else
         {
             uint32 rate = AudioCtrl->ahiac_MixFreq;
             uint8  rate_data[3];
@@ -2142,7 +2365,12 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
                     rate_data, 3, 5000);
 
             if (r < 0)
-                DPRINTF("[USBAudio] Start: SET_CUR sample rate failed: %ld\n", r);
+            {
+                if (r == -9 /* LIBUSB_ERROR_PIPE: device STALLed the request */)
+                    DPRINTF("[USBAudio] Start: SET_CUR sample rate not accepted (STALL) - device uses fixed hardware rate\n");
+                else
+                    DPRINTF("[USBAudio] Start: SET_CUR sample rate failed: %ld\n", r);
+            }
             else
                 DPRINTF("[USBAudio] Start: SET_CUR sample rate OK\n");
         }
@@ -2193,6 +2421,11 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
             return AHIE_UNKNOWN;
         }
 
+        /* Track whether WE opened the device here (record-only mode).  If PLAY
+         * already opened it, the handle is shared and must NOT be closed on a
+         * recording-setup failure. */
+        int32 rec_opened_device = 0;
+
         /* If device is not yet open (record-only mode), open it now */
         if (dd->ua_DevHandle == NULL)
         {
@@ -2203,6 +2436,7 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
                 DPRINTF("[USBAudio] Start: cannot open device for recording\n");
                 return AHIE_UNKNOWN;
             }
+            rec_opened_device = 1;
         }
 
         /* The scan phase only sees alt 0 (zero bandwidth, no endpoints),
@@ -2232,6 +2466,11 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
             if (r != LIBUSB_SUCCESS)
             {
                 DPRINTF("[USBAudio] Start: cannot claim recording interface\n");
+                if (rec_opened_device)
+                {
+                    ILibusb1->libusb_close(dd->ua_DevHandle);
+                    dd->ua_DevHandle = NULL;
+                }
                 return AHIE_UNKNOWN;
             }
 
@@ -2241,6 +2480,17 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
                                                             dd->ua_RecAltSetting);
             DPRINTF("[USBAudio] Start: set_alt_setting(%ld, %ld) for recording => %ld\n",
                                (LONG)dd->ua_RecInterfaceNum, (LONG)dd->ua_RecAltSetting, r);
+            if (r != LIBUSB_SUCCESS)
+            {
+                DPRINTF("[USBAudio] Start: rec set_alt_setting failed, aborting\n");
+                ILibusb1->libusb_release_interface(dd->ua_DevHandle, dd->ua_RecInterfaceNum);
+                if (rec_opened_device)
+                {
+                    ILibusb1->libusb_close(dd->ua_DevHandle);
+                    dd->ua_DevHandle = NULL;
+                }
+                return AHIE_UNKNOWN;
+            }
 
             g_active_rec_iface = dd->ua_RecInterfaceNum;
 
@@ -2287,6 +2537,15 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
         if (dd->ua_RecBuffer == NULL)
         {
             DPRINTF("[USBAudio] Start: cannot allocate recording buffer\n");
+            ILibusb1->libusb_set_interface_alt_setting(dd->ua_DevHandle,
+                                                        dd->ua_RecInterfaceNum, 0);
+            ILibusb1->libusb_release_interface(dd->ua_DevHandle, dd->ua_RecInterfaceNum);
+            g_active_rec_iface = -1;
+            if (rec_opened_device)
+            {
+                ILibusb1->libusb_close(dd->ua_DevHandle);
+                dd->ua_DevHandle = NULL;
+            }
             return AHIE_NOMEM;
         }
 
@@ -2312,6 +2571,18 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
             if (dd->ua_RecSlaveTask == NULL)
             {
                 DPRINTF("[USBAudio] Start: record slave died during init!\n");
+                dd->ua_IsRecording = FALSE;
+                IExec->FreeVec(dd->ua_RecBuffer);
+                dd->ua_RecBuffer = NULL;
+                ILibusb1->libusb_set_interface_alt_setting(dd->ua_DevHandle,
+                                                            dd->ua_RecInterfaceNum, 0);
+                ILibusb1->libusb_release_interface(dd->ua_DevHandle, dd->ua_RecInterfaceNum);
+                g_active_rec_iface = -1;
+                if (rec_opened_device)
+                {
+                    ILibusb1->libusb_close(dd->ua_DevHandle);
+                    dd->ua_DevHandle = NULL;
+                }
                 return AHIE_UNKNOWN;
             }
             DPRINTF("[USBAudio] Start: record slave alive, recording running\n");
@@ -2322,6 +2593,18 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
         else
         {
             DPRINTF("[USBAudio] Start: CreateNewProcTags for recording failed!\n");
+            dd->ua_IsRecording = FALSE;
+            IExec->FreeVec(dd->ua_RecBuffer);
+            dd->ua_RecBuffer = NULL;
+            ILibusb1->libusb_set_interface_alt_setting(dd->ua_DevHandle,
+                                                        dd->ua_RecInterfaceNum, 0);
+            ILibusb1->libusb_release_interface(dd->ua_DevHandle, dd->ua_RecInterfaceNum);
+            g_active_rec_iface = -1;
+            if (rec_opened_device)
+            {
+                ILibusb1->libusb_close(dd->ua_DevHandle);
+                dd->ua_DevHandle = NULL;
+            }
             return AHIE_NOMEM;
         }
     }
@@ -2359,6 +2642,15 @@ uint32 _usbaudio_AHIsub_Stop(struct USBAudioIFace    *Self,
                               struct AHIAudioCtrlDrv  *AudioCtrl)
 {
     DPRINTF("[USBAudio] AHIsub_Stop: Flags=0x%08lx\n", Flags);
+
+    /* Defensive: AHIsub_Start calls us first thing, and AHI may call Stop on
+     * a session whose DriverData was never allocated (or already freed).
+     * Every access below goes through dd = *ahiac_DriverData, so bail out. */
+    if (AudioCtrl == NULL || AudioCtrl->ahiac_DriverData == NULL)
+    {
+        DPRINTF("[USBAudio] AHIsub_Stop: no DriverData, nothing to stop\n");
+        return AHIE_OK;
+    }
 
     if (Flags & AHISF_PLAY)
     {
@@ -2509,6 +2801,10 @@ int32 _usbaudio_AHIsub_GetAttr(struct USBAudioIFace    *Self,
                                 struct TagItem          *tagList,
                                 struct AHIAudioCtrlDrv  *AudioCtrl)
 {
+    /* Ensure USB scan has run so we return real device capabilities.
+     * AHI calls GetAttr directly (via AHI_GetAudioAttrsA) without always
+     * calling AllocAudio first, so the lazy scan must happen here too. */
+    scan_usb_audio_device();
 
     DPRINTF("[USBAudio] GetAttr: Attr=0x%08lx Arg=%ld Def=%ld\n",
                        Attribute, Argument, DefValue);
@@ -2518,15 +2814,66 @@ int32 _usbaudio_AHIsub_GetAttr(struct USBAudioIFace    *Self,
         case AHIDB_Bits:
             return 16;
 
+        case AHIDB_MinMixFreq:
+            /* Minimum mixing rate: lowest value in the device's frequency list */
+            if (g_usb_info.num_frequencies > 0)
+            {
+                uint32 minf = g_usb_info.frequencies[0];
+                int32 fi;
+                for (fi = 1; fi < g_usb_info.num_frequencies; fi++)
+                    if (g_usb_info.frequencies[fi] < minf)
+                        minf = g_usb_info.frequencies[fi];
+                return (LONG)minf;
+            }
+            return 44100;
+
+        case AHIDB_MaxMixFreq:
+            /* Maximum mixing rate: highest value in the device's frequency list */
+            if (g_usb_info.num_frequencies > 0)
+            {
+                uint32 maxf = g_usb_info.frequencies[0];
+                int32 fi;
+                for (fi = 1; fi < g_usb_info.num_frequencies; fi++)
+                    if (g_usb_info.frequencies[fi] > maxf)
+                        maxf = g_usb_info.frequencies[fi];
+                return (LONG)maxf;
+            }
+            return 48000;
+
         case AHIDB_Frequencies:
-            return 2;
+            /* Number of discrete mixing rates supported */
+            return (g_usb_info.num_frequencies > 0) ?
+                   (LONG)g_usb_info.num_frequencies : 2;
 
         case AHIDB_Frequency:   /* Index -> Frequency */
+            if (g_usb_info.num_frequencies > 0)
+            {
+                if (Argument >= 0 && Argument < g_usb_info.num_frequencies)
+                    return (LONG)g_usb_info.frequencies[Argument];
+                return DefValue;
+            }
             if (Argument == 0) return 44100;
             if (Argument == 1) return 48000;
             return DefValue;
 
         case AHIDB_Index:       /* Frequency -> closest Index */
+            if (g_usb_info.num_frequencies > 0)
+            {
+                uint32 req  = (uint32)Argument;
+                int32  best = 0;
+                uint32 bestd = (req > g_usb_info.frequencies[0]) ?
+                               (req - g_usb_info.frequencies[0]) :
+                               (g_usb_info.frequencies[0] - req);
+                int32 fi;
+                for (fi = 1; fi < g_usb_info.num_frequencies; fi++)
+                {
+                    uint32 d = (req > g_usb_info.frequencies[fi]) ?
+                               (req - g_usb_info.frequencies[fi]) :
+                               (g_usb_info.frequencies[fi] - req);
+                    if (d < bestd) { bestd = d; best = fi; }
+                }
+                return best;
+            }
             if (Argument <= 46050)  /* midpoint between 44100 and 48000 */
                 return 0;
             return 1;
@@ -2541,10 +2888,47 @@ int32 _usbaudio_AHIsub_GetAttr(struct USBAudioIFace    *Self,
             return (LONG)VSTRING;
 
         case AHIDB_Record:
+            DPRINTF("[USBAudio] GetAttr: AHIDB_Record => %ld (rec_found=%ld scanned=%ld)\n",
+                               (LONG)(g_usb_info.rec_found ? TRUE : FALSE),
+                               (LONG)g_usb_info.rec_found, (LONG)g_usb_info.scanned);
             return (g_usb_info.rec_found ? TRUE : FALSE);
 
         case AHIDB_FullDuplex:
+            DPRINTF("[USBAudio] GetAttr: AHIDB_FullDuplex => %ld (rec_found=%ld)\n",
+                               (LONG)(g_usb_info.rec_found ? TRUE : FALSE),
+                               (LONG)g_usb_info.rec_found);
             return (g_usb_info.rec_found ? TRUE : FALSE);
+
+        case AHIDB_Stereo:
+            return TRUE;    /* We always work in stereo */
+
+        case AHIDB_MultiChannel:
+            /* Return TRUE only for the multichannel AudioID (0x00550002)
+             * AND only if the device actually has 4+ physical channels.
+             * For all other cases (stereo device, stereo AudioID) → FALSE.
+             * Note: AllocAudio already rejects AudioID 0x00550002 when
+             * the device has < 4 channels, so this branch only executes
+             * if the hardware truly supports multichannel. */
+            if (tagList != NULL)
+            {
+                uint32 aid = IUtility->GetTagData(AHIA_AudioID, 0, tagList);
+                if (aid == 0x00550002)
+                {
+                    int32 max_ch = (int32)g_usb_info.nr_channels;
+                    if (g_usb_info.num_outputs > 0)
+                        max_ch = (int32)g_usb_info.outputs[0].nr_channels;
+                    return (max_ch >= 4) ? TRUE : FALSE;
+                }
+            }
+            return FALSE;
+
+        case AHIDB_MaxChannels:
+            /* Number of simultaneous AHI software-mixing voices.
+             * This driver does software mixing via AHI's own mixer
+             * and just sends the pre-mixed stream over USB, so there
+             * is no hardware limit on the number of voices.
+             * Return the AHI default (DefValue = 128). */
+            return DefValue;
 
         case AHIDB_Realtime:
             return TRUE;        /* This is a real-time audio output */
@@ -2576,11 +2960,17 @@ int32 _usbaudio_AHIsub_GetAttr(struct USBAudioIFace    *Self,
 
         /* ---- Inputs / Outputs ---- */
         case AHIDB_Inputs:
+            DPRINTF("[USBAudio] GetAttr: AHIDB_Inputs => %ld\n",
+                               (LONG)((g_num_flat_inputs > 0) ? g_num_flat_inputs : 0));
             return (g_num_flat_inputs > 0) ? g_num_flat_inputs : 0;
 
         case AHIDB_Input:
             if (Argument >= 0 && Argument < g_num_flat_inputs)
+            {
+                DPRINTF("[USBAudio] GetAttr: AHIDB_Input[%ld] => \"%s\"\n",
+                                   Argument, g_usb_flat_inputs[Argument].name);
                 return (LONG)g_usb_flat_inputs[Argument].name;
+            }
             return (LONG)"Line In";
 
         case AHIDB_Outputs:
@@ -2645,10 +3035,12 @@ static void set_usb_volume(struct USBAudioData *ua, Fixed ahi_vol)
     else
     {
         /* Linear interpolation between VolMin and VolMax.
-         * ahi_vol is 0..0x10000, map to VolMin..VolMax range */
+         * ahi_vol is 0..0x10000, map to VolMin..VolMax range.
+         * Use int64 for the product: range can be up to ~65535 and ahi_vol
+         * up to 0xFFFF, so range*ahi_vol overflows a signed int32. */
         int32 range = (int32)ua->ua_VolMax - (int32)ua->ua_VolMin;
         usb_vol = (int16)((int32)ua->ua_VolMin +
-                          (range * (int32)ahi_vol) / 0x10000);
+                          (int32)(((int64)range * (int64)ahi_vol) / 0x10000));
     }
 
     /* Clamp to device range */
@@ -2702,9 +3094,10 @@ static void set_usb_input_gain(struct USBAudioData *ua, Fixed ahi_gain)
     }
     else
     {
+        /* int64 product to avoid signed int32 overflow (see set_usb_volume) */
         int32 range = (int32)ua->ua_RecVolMax - (int32)ua->ua_RecVolMin;
         usb_vol = (int16)((int32)ua->ua_RecVolMin +
-                          (range * (int32)ahi_gain) / 0x10000);
+                          (int32)(((int64)range * (int64)ahi_gain) / 0x10000));
     }
 
     /* Clamp to device range */
@@ -2753,7 +3146,7 @@ static void set_usb_selector(struct USBAudioData *ua, uint8 pin)
 
     r = ILibusb1->libusb_control_transfer(ua->ua_DevHandle,
         USB_AUDIO_REQ_SET_IF, USB_AUDIO_SET_CUR,
-        0x0000,  /* Selector control */
+        USB_AUDIO_SU_SELECTOR_CONTROL,  /* Selector Unit CS=0x01: wValue=0x0100 */
         (uint16)((ua->ua_SelectorUnitID << 8) | ua->ua_ACIfaceNum),
         pin_data, 1, 5000);
 
@@ -2777,6 +3170,11 @@ int32 _usbaudio_AHIsub_HardwareControl(struct USBAudioIFace    *Self,
                                         int32                    Argument,
                                         struct AHIAudioCtrlDrv  *AudioCtrl)
 {
+    /* Every case dereferences dd = *ahiac_DriverData; guard against AHI
+     * calling us with no allocated driver data. */
+    if (AudioCtrl == NULL || AudioCtrl->ahiac_DriverData == NULL)
+        return FALSE;
+
     switch (Attribute)
     {
         case AHIC_MonitorVolume:

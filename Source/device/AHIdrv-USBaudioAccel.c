@@ -41,7 +41,7 @@ uint32 _usbaudio_AHIsub_SetFreq(struct USBAudioIFace    *Self,
 
 uint32 _usbaudio_AHIsub_SetSound(struct USBAudioIFace    *Self,
                                   uint16                   Channel,
-                                  int16                    Sound,
+                                  uint16                   Sound,
                                   uint32                   Offset,
                                   int32                    Lenght,
                                   struct AHIAudioCtrlDrv  *AudioCtrl,

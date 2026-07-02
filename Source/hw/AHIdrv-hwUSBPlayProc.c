@@ -32,10 +32,11 @@
 #include <string.h>
 #include "includes/AHIdrv-USBaudio.h"
 
-/* Minimum number of isochronous IORequests to keep in flight.
- * More requests = larger buffer = more resilient to scheduling jitter.
- * 8 IOReqs at 1 frame each = ~8ms cushion. */
-#define MIN_ISO_IOS 8
+/* NOTE: the number of in-flight IORequests is intentionally driven by the
+ * HCD's USBA_HCD_CachedIsochronousFrames (clamped to a minimum of 2 below),
+ * NOT by a fixed count — exceeding what the HCD can schedule causes
+ * "[EHCI] EndPoint iso schedule full" and corrupts the pipe.  Timing
+ * resilience instead comes from packing FRAMES_PER_IOR frames per request. */
 
 /* Number of USB frames packed into each isochronous IORequest.
  * More frames per IOReq = larger buffer = more time for refill.
@@ -189,6 +190,55 @@ static uint32 mix_to_usb(struct AHIAudioCtrlDrv *AudioCtrl, uint8 *outbuf)
     }
 
     return samples * (uint32)dd->ua_SubframeSize;
+}
+
+/*
+ * fill_from_staging
+ *
+ * Copies exactly `need` bytes into `dst`, pulling from the staging buffer and
+ * re-running mix_to_usb() as many times as necessary.  The previous inline
+ * version only handled a single wrap: if one IORequest needed more bytes than
+ * an entire freshly-mixed staging buffer, staging_off would run past
+ * staging_size and the next (staging_size - staging_off) computation would
+ * underflow (unsigned), producing a huge memcpy.  Looping handles any ratio
+ * between per-IOReq size and mix-buffer size.
+ *
+ * *staging_size / *staging_off carry the staging cursor across calls.
+ */
+static void fill_from_staging(struct AHIAudioCtrlDrv *AudioCtrl,
+                              uint8 *dst, uint32 need,
+                              uint8 *staging,
+                              uint32 *staging_size, uint32 *staging_off)
+{
+    uint32 done = 0;
+
+    while (done < need)
+    {
+        uint32 remaining = *staging_size - *staging_off;
+
+        if (remaining == 0)
+        {
+            /* Staging exhausted — produce a fresh mix buffer */
+            *staging_size = mix_to_usb(AudioCtrl, staging);
+            *staging_off  = 0;
+            /* Guard against a mixer that returns 0 bytes (avoid infinite
+             * loop): zero-fill the rest and bail. */
+            if (*staging_size == 0)
+            {
+                memset(dst + done, 0, need - done);
+                return;
+            }
+            continue;
+        }
+
+        uint32 chunk = need - done;
+        if (chunk > remaining)
+            chunk = remaining;
+
+        memcpy(dst + done, staging + *staging_off, chunk);
+        done         += chunk;
+        *staging_off += chunk;
+    }
 }
 
 /*
@@ -478,22 +528,9 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
             }
 
             /* Fill IOReq from staging, wrapping to next mix as needed */
-            {
-                uint32 remaining = staging_size - staging_off;
-                if (remaining >= bytesThisFrame)
-                {
-                    memcpy(iorTable[x]->io_Data, staging + staging_off, bytesThisFrame);
-                    staging_off += bytesThisFrame;
-                }
-                else
-                {
-                    memcpy(iorTable[x]->io_Data, staging + staging_off, remaining);
-                    staging_size = mix_to_usb(AudioCtrl, staging);
-                    staging_off  = bytesThisFrame - remaining;
-                    memcpy((uint8 *)iorTable[x]->io_Data + remaining,
-                           staging, staging_off);
-                }
-            }
+            fill_from_staging(AudioCtrl, (uint8 *)iorTable[x]->io_Data,
+                              bytesThisFrame, staging,
+                              &staging_size, &staging_off);
 
             iorTable[x]->io_Command  = CMD_WRITE;
             iorTable[x]->io_EndPoint = ep;
@@ -583,22 +620,9 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                             }
 
                             /* Fill this IOReq with fresh audio from staging */
-                            {
-                                uint32 remaining = staging_size - staging_off;
-                                if (remaining >= bytesThisFrame)
-                                {
-                                    memcpy(ureq->io_Data, staging + staging_off, bytesThisFrame);
-                                    staging_off += bytesThisFrame;
-                                }
-                                else
-                                {
-                                    memcpy(ureq->io_Data, staging + staging_off, remaining);
-                                    staging_size = mix_to_usb(AudioCtrl, staging);
-                                    staging_off  = bytesThisFrame - remaining;
-                                    memcpy((uint8 *)ureq->io_Data + remaining,
-                                           staging, staging_off);
-                                }
-                            }
+                            fill_from_staging(AudioCtrl, (uint8 *)ureq->io_Data,
+                                              bytesThisFrame, staging,
+                                              &staging_size, &staging_off);
 
                             /* Re-send immediately */
                             ureq->io_Command  = CMD_WRITE;
@@ -663,13 +687,23 @@ quit:
     if (usbPort)
         IExec->FreeSysObject(ASOT_PORT, usbPort);
 
-    IExec->Forbid();
-    dd->ua_SlaveTask = NULL;
-    IExec->FreeSignal(dd->ua_SlaveSignal);
-    dd->ua_SlaveSignal = -1;
+    /* Only touch driver data / signal the master if we actually have a valid
+     * AudioCtrl and DriverData — the early "AudioCtrl == NULL" bailout above
+     * jumps here too, and dereferencing dd (which reads ahiac_DriverData)
+     * would crash otherwise. */
+    if (AudioCtrl != NULL && AudioCtrl->ahiac_DriverData != NULL)
+    {
+        IExec->Forbid();
+        dd->ua_SlaveTask = NULL;
+        if (dd->ua_SlaveSignal != -1)
+        {
+            IExec->FreeSignal(dd->ua_SlaveSignal);
+            dd->ua_SlaveSignal = -1;
+        }
 
-    /* Tell master we are dying */
-    IExec->Signal((struct Task *)dd->ua_MasterTask, 1L << dd->ua_MasterSignal);
+        /* Tell master we are dying */
+        IExec->Signal((struct Task *)dd->ua_MasterTask, 1L << dd->ua_MasterSignal);
+    }
 
     /* Multitasking will resume when we are dead */
     return 0;

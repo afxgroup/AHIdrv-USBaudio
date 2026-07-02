@@ -32,6 +32,7 @@
 /* USB Audio Class Feature Unit control selectors (bmaControls bitmap) */
 #define USB_AUDIO_FU_MUTE_CONTROL        0x01
 #define USB_AUDIO_FU_VOLUME_CONTROL      0x02
+#define USB_AUDIO_SU_SELECTOR_CONTROL    (0x01 << 8)  /* Selector Unit: CS=1, wValue=0x0100 */
 
 /* USB Audio Class bmRequestType for control interface */
 #define USB_AUDIO_REQ_SET_IF  0x21  /* Host-to-Device | Class | Interface */
@@ -92,6 +93,7 @@ struct USBOutputMode {
     uint8  channel_offset;  /* Starting sample offset for this pair (0,2,4,6) */
     uint32 frequencies[MAX_USB_FREQUENCIES];
     int32  num_frequencies;
+    uint8  rate_ctrl;       /* 1 if CS_ENDPOINT bmAttributes D0=1 (sampling freq control) */
     char   name[48];        /* e.g. "Front", "Rear" */
 };
 
@@ -262,6 +264,7 @@ struct USBAudioData
     uint8                ua_SubframeSize;
     uint8                ua_BitResolution;
     uint8                ua_ChannelOffset;   /* Which channel pair (0,2,4,6) */
+    uint8                ua_RateCtrl;        /* 1 if endpoint declares sampling freq control */
 
     /* Mixing / output buffers (triple-buffered for glitch-free playback) */
     APTR                 ua_MixBuffer;

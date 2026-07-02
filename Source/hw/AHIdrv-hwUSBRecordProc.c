@@ -30,8 +30,9 @@
 #include <string.h>
 #include "includes/AHIdrv-USBaudio.h"
 
-/* Minimum number of isochronous IORequests for recording */
-#define MIN_REC_ISO_IOS 8
+/* NOTE: as in the playback slave, the in-flight IORequest count is driven by
+ * the HCD's USBA_HCD_CachedIsochronousFrames (clamped to a minimum of 2),
+ * not by a fixed number — exceeding the HCD schedule corrupts the pipe. */
 
 #define dd ((struct USBAudioData *)AudioCtrl->ahiac_DriverData)
 
@@ -429,13 +430,22 @@ quit:
     if (usbPort)
         IExec->FreeSysObject(ASOT_PORT, usbPort);
 
-    IExec->Forbid();
-    dd->ua_RecSlaveTask = NULL;
-    IExec->FreeSignal(dd->ua_RecSlaveSignal);
-    dd->ua_RecSlaveSignal = -1;
+    /* Only touch driver data / signal the master if AudioCtrl and DriverData
+     * are valid — the early "AudioCtrl == NULL" bailout jumps here too, and
+     * dereferencing dd (which reads ahiac_DriverData) would crash otherwise. */
+    if (AudioCtrl != NULL && AudioCtrl->ahiac_DriverData != NULL)
+    {
+        IExec->Forbid();
+        dd->ua_RecSlaveTask = NULL;
+        if (dd->ua_RecSlaveSignal != -1)
+        {
+            IExec->FreeSignal(dd->ua_RecSlaveSignal);
+            dd->ua_RecSlaveSignal = -1;
+        }
 
-    /* Tell master we are dying */
-    IExec->Signal((struct Task *)dd->ua_MasterTask, 1L << dd->ua_MasterSignal);
+        /* Tell master we are dying */
+        IExec->Signal((struct Task *)dd->ua_MasterTask, 1L << dd->ua_MasterSignal);
+    }
 
     return 0;
 }

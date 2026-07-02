@@ -141,10 +141,9 @@ struct mode_def {
 };
 
 static const struct mode_def modes[] = {
-    { 0x00550001, 1, 1, 1, 1, 0, "USB Audio:HiFi 16 bit stereo++"     },
-    { 0x00550002, 1, 1, 1, 1, 1, "USB Audio:HiFi 16 bit 7.1 channel++" },
-    { 0x00550003, 1, 1, 1, 0, 0, "USB Audio:16 bit stereo"             },
-    { 0x00550005, 1, 0, 0, 0, 0, "USB Audio:16 bit mono"               },
+    { 0x00550001, 1, 1, 1, 1, 0, "USB Audio:HiFi 16 bit stereo++"      },
+    { 0x00550002, 1, 1, 1, 1, 1, "USB Audio:HiFi 16 bit multichannel++" },
+    { 0x00550003, 1, 1, 1, 0, 0, "USB Audio:16 bit stereo"              },
 };
 #define NUM_MODES (sizeof(modes) / sizeof(modes[0]))
 

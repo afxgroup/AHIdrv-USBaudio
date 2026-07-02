@@ -69,6 +69,9 @@ int32 _start(void)
     return RETURN_FAIL;
 }
 
+/* Forward declaration — libClose may trigger a deferred expunge */
+STATIC APTR libExpunge(struct LibraryManagerInterface *Self);
+
 /*
  * Interface stub functions
  */
@@ -115,6 +118,10 @@ STATIC struct USBAudioBase *libOpen(struct LibraryManagerInterface *Self, ULONG 
     }
 
     libBase->libNode.lib_OpenCnt++;
+
+    /* A pending deferred expunge is cancelled by a new open. */
+    libBase->libNode.lib_Flags &= ~LIBF_DELEXP;
+
     DPRINTF("[USBAudio] libOpen: OK, OpenCnt=%lu\n", (ULONG)libBase->libNode.lib_OpenCnt);
     return libBase;
 }
@@ -127,6 +134,15 @@ STATIC APTR libClose(struct LibraryManagerInterface *Self)
     struct USBAudioBase *libBase = (struct USBAudioBase *)Self->Data.LibBase;
 
     libBase->libNode.lib_OpenCnt--;
+
+    /* If this was the last user and an expunge was deferred while open,
+     * complete it now and return the seglist so the loader can unload us. */
+    if (libBase->libNode.lib_OpenCnt == 0 &&
+        (libBase->libNode.lib_Flags & LIBF_DELEXP))
+    {
+        return libExpunge(Self);
+    }
+
     return 0;
 }
 
@@ -151,19 +167,21 @@ STATIC APTR libExpunge(struct LibraryManagerInterface *Self)
             ILibusb1->libusb_exit(NULL);
         }
 
-        if (ILibusb1)   IExec->DropInterface((struct Interface *)ILibusb1);
-        if (Libusb1Base) IExec->CloseLibrary(Libusb1Base);
+        /* NULL each global after release so the expunge is idempotent and a
+         * stray later access hits NULL rather than a freed library base. */
+        if (ILibusb1)    { IExec->DropInterface((struct Interface *)ILibusb1); ILibusb1 = NULL; }
+        if (Libusb1Base) { IExec->CloseLibrary(Libusb1Base);                   Libusb1Base = NULL; }
 #ifndef __CLIB4__
-        if (INewlib)    IExec->DropInterface(INewlib);
-        if (NewlibBase) IExec->CloseLibrary(NewlibBase);
+        if (INewlib)     { IExec->DropInterface(INewlib);                      INewlib = NULL; }
+        if (NewlibBase)  { IExec->CloseLibrary(NewlibBase);                    NewlibBase = NULL; }
 #else
-        if (IClib4)     IExec->DropInterface(IClib4);
-        if (Clib4Base)  IExec->CloseLibrary(Clib4Base);
+        if (IClib4)      { IExec->DropInterface(IClib4);                       IClib4 = NULL; }
+        if (Clib4Base)   { IExec->CloseLibrary(Clib4Base);                     Clib4Base = NULL; }
 #endif
-        if (IUtility)   IExec->DropInterface((struct Interface *)IUtility);
-        if (UtilityBase) IExec->CloseLibrary(UtilityBase);
-        if (IDOS)       IExec->DropInterface((struct Interface *)IDOS);
-        if (DOSBase)    IExec->CloseLibrary(DOSBase);
+        if (IUtility)    { IExec->DropInterface((struct Interface *)IUtility); IUtility = NULL; }
+        if (UtilityBase) { IExec->CloseLibrary(UtilityBase);                   UtilityBase = NULL; }
+        if (IDOS)        { IExec->DropInterface((struct Interface *)IDOS);     IDOS = NULL; }
+        if (DOSBase)     { IExec->CloseLibrary(DOSBase);                       DOSBase = NULL; }
 
         IExec->Remove((struct Node *)libBase);
         IExec->DeleteLibrary((struct Library *)libBase);
@@ -206,45 +224,33 @@ STATIC struct USBAudioBase *libInit(struct Library *LibraryBase, APTR seglist, s
 
     /* Open dos.library */
     DOSBase = IExec->OpenLibrary("dos.library", 50L);
-    if (DOSBase)
-    {
-        IDOS = (struct DOSIFace *)IExec->GetInterface(DOSBase, "main", 1, NULL);
-        if (!IDOS) { DPRINTF("[USBAudio] Failed to get IDOS interface\n"); return NULL; }
-    }
-    else { DPRINTF("[USBAudio] Failed to open dos.library\n"); return NULL; }
+    if (!DOSBase) { DPRINTF("[USBAudio] Failed to open dos.library\n"); goto fail; }
+    IDOS = (struct DOSIFace *)IExec->GetInterface(DOSBase, "main", 1, NULL);
+    if (!IDOS) { DPRINTF("[USBAudio] Failed to get IDOS interface\n"); goto fail; }
 
     DPRINTF("[USBAudio] dos.library opened OK\n");
 
     /* Open utility.library */
     UtilityBase = IExec->OpenLibrary("utility.library", 50L);
-    if (UtilityBase)
-    {
-        IUtility = (struct UtilityIFace *)IExec->GetInterface(UtilityBase, "main", 1, NULL);
-        if (!IUtility) { DPRINTF("[USBAudio] Failed to get IUtility interface\n"); return NULL; }
-    }
-    else { DPRINTF("[USBAudio] Failed to open utility.library\n"); return NULL; }
+    if (!UtilityBase) { DPRINTF("[USBAudio] Failed to open utility.library\n"); goto fail; }
+    IUtility = (struct UtilityIFace *)IExec->GetInterface(UtilityBase, "main", 1, NULL);
+    if (!IUtility) { DPRINTF("[USBAudio] Failed to get IUtility interface\n"); goto fail; }
 
     DPRINTF("[USBAudio] utility.library opened OK\n");
 
 #ifndef __CLIB4__
     /* Open newlib.library (required for C runtime in shared lib) */
     NewlibBase = IExec->OpenLibrary("newlib.library", 50L);
-    if (NewlibBase)
-    {
-        INewlib = IExec->GetInterface(NewlibBase, "main", 1, NULL);
-        if (!INewlib) { DPRINTF("[USBAudio] Failed to get INewlib interface\n"); return NULL; }
-    }
-    else { DPRINTF("[USBAudio] Failed to open newlib.library\n"); return NULL; }
+    if (!NewlibBase) { DPRINTF("[USBAudio] Failed to open newlib.library\n"); goto fail; }
+    INewlib = IExec->GetInterface(NewlibBase, "main", 1, NULL);
+    if (!INewlib) { DPRINTF("[USBAudio] Failed to get INewlib interface\n"); goto fail; }
     DPRINTF("[USBAudio] newlib.library opened OK\n");
 #else
     /* Open clib4.library (required for C runtime in shared lib) */
     Clib4Base = IExec->OpenLibrary("clib4.library", 2L);
-    if (Clib4Base)
-    {
-        IClib4 = IExec->GetInterface(Clib4Base, "main", 1, NULL);
-        if (!IClib4) { DPRINTF("[USBAudio] Failed to get IClib4 interface\n"); return NULL; }
-    }
-    else { DPRINTF("[USBAudio] Failed to open clib4.library\n"); return NULL; }
+    if (!Clib4Base) { DPRINTF("[USBAudio] Failed to open clib4.library\n"); goto fail; }
+    IClib4 = IExec->GetInterface(Clib4Base, "main", 1, NULL);
+    if (!IClib4) { DPRINTF("[USBAudio] Failed to get IClib4 interface\n"); goto fail; }
     DPRINTF("[USBAudio] clib4.library opened OK\n");
 #endif
 
@@ -255,6 +261,24 @@ STATIC struct USBAudioBase *libInit(struct Library *LibraryBase, APTR seglist, s
 
     DPRINTF("[USBAudio] libInit: complete\n");
     return libBase;
+
+fail:
+    /* Release everything opened so far, in reverse order.  On init failure
+     * the OS does NOT call libExpunge, so without this the already-opened
+     * libraries/interfaces would leak permanently.  Guarded + NULLed so the
+     * cleanup is order-independent. */
+#ifndef __CLIB4__
+    if (INewlib)    { IExec->DropInterface(INewlib);              INewlib = NULL; }
+    if (NewlibBase) { IExec->CloseLibrary(NewlibBase);           NewlibBase = NULL; }
+#else
+    if (IClib4)     { IExec->DropInterface(IClib4);               IClib4 = NULL; }
+    if (Clib4Base)  { IExec->CloseLibrary(Clib4Base);            Clib4Base = NULL; }
+#endif
+    if (IUtility)   { IExec->DropInterface((struct Interface *)IUtility); IUtility = NULL; }
+    if (UtilityBase){ IExec->CloseLibrary(UtilityBase);         UtilityBase = NULL; }
+    if (IDOS)       { IExec->DropInterface((struct Interface *)IDOS);     IDOS = NULL; }
+    if (DOSBase)    { IExec->CloseLibrary(DOSBase);             DOSBase = NULL; }
+    return NULL;
 }
 
 /*
