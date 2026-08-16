@@ -338,6 +338,48 @@ static void staging_read(struct AHIAudioCtrlDrv *AudioCtrl,
 }
 
 /*
+ * setup_ior_sizes
+ *
+ * Programs the per-sub-frame transfer setups of one IORequest and returns the
+ * total byte count.  The fractional accumulator keeps the long-term average
+ * sample rate exact (e.g. at 44100 Hz with 1ms frames, 44 samples per frame
+ * with a 45th every tenth frame).
+ *
+ * Shared by the initial launch and the refill path so the two cannot drift.
+ */
+static uint32 setup_ior_sizes(struct USBSysIFace *IUSBSys, struct USBIOReq *ureq,
+                              uint32 subXfers, uint32 baseSamples,
+                              uint32 fracNum, uint32 fracDen,
+                              uint32 *accumulator, uint32 frameSize,
+                              uint32 maxTransferSize)
+{
+    uint32 y;
+    uint32 bytesThisFrame = 0;
+
+    for (y = 0; y < subXfers; y++)
+    {
+        uint32 n = baseSamples;
+        uint32 subLen;
+
+        *accumulator += fracNum;
+        if (*accumulator >= fracDen)
+        {
+            *accumulator -= fracDen;
+            n++;
+        }
+
+        subLen = n * frameSize;
+        if (subLen > maxTransferSize)
+            subLen = maxTransferSize;
+
+        IUSBSys->USBSetIsoTransferSetup(ureq, y, bytesThisFrame, subLen);
+        bytesThisFrame += subLen;
+    }
+
+    return bytesThisFrame;
+}
+
+/*
  * hwUSBPlaySlave
  *
  * Entry point for the playback process created in AHIsub_Start.
@@ -356,6 +398,8 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
     uint32 consecutive_fatal = 0;  /* consecutive fatal USB errors (device removed) */
     uint32 framemissed_count = 0;  /* USBERR_FRAMEMISSED: audio never reached the bus */
     uint32 checkresults_count = 0; /* USBERR_CHECKRESULTS: partial sub-transfer failure */
+    uint32 rejected_count = 0;     /* submissions the HCD refused to schedule */
+    uint32 backoff_count = 0;      /* times the circuit breaker had to sleep */
 
     /* Local USB resources — opened and freed entirely within this process */
     struct MsgPort    *usbPort    = NULL;
@@ -363,6 +407,11 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
     struct USBSysIFace *IUSBSys   = NULL;
     struct USBIOReq  **iorTable   = NULL;
     uint32             iorCount   = 0;
+    uint32            *iorSendFrame = NULL; /* USB frame number at submission */
+    uint32            *iorLength  = NULL;   /* io_Length as submitted, for retries */
+    uint8             *iorParked  = NULL;   /* 1 = rejected, awaiting retry */
+    BOOL               haveFrameNo = FALSE; /* HCD maintains a frame number */
+    uint32             inflight   = 0;      /* requests currently submitted */
     struct UsbEndPoint *ep        = NULL;
     BOOL               deviceOpen = FALSE;
 
@@ -478,7 +527,7 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
         uint32 accumulator = 0;  /* fractional sample accumulator */
         uint32 subXfersPerIOR;   /* total sub-transfers per IORequest */
         uint32 iorBufSize;       /* DMA buffer size per IORequest */
-        uint32 x, y;
+        uint32 x;
 
         IUSBSys->USBGetEndPointAttrs(ep,
             USBA_HCD_CachedIsochronousFrames, &cachedFrames,
@@ -609,6 +658,40 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
         DPRINTF("[USBAudio] PlaySlave: allocated %lu IORequests (%lu bytes, %lu subXfers each)\n",
                            (ULONG)iorCount, (ULONG)iorBufSize, (ULONG)subXfersPerIOR);
 
+        /* Per-request bookkeeping for the rejected-submission detector. */
+        iorSendFrame = (uint32 *)IExec->AllocVecTags(sizeof(uint32) * iorCount,
+                           AVT_ClearWithValue, 0, TAG_END);
+        iorLength    = (uint32 *)IExec->AllocVecTags(sizeof(uint32) * iorCount,
+                           AVT_ClearWithValue, 0, TAG_END);
+        iorParked    = (uint8 *)IExec->AllocVecTags(sizeof(uint8) * iorCount,
+                           AVT_ClearWithValue, 0, TAG_END);
+        if (!iorSendFrame || !iorLength || !iorParked)
+        {
+            DPRINTF("[USBAudio] PlaySlave: request state alloc failed\n");
+            goto quit;
+        }
+
+        /* The rejected-submission detector compares the USB frame number at
+         * submission with the one at completion.  That only works if this HCD
+         * maintains a frame number; if it does not we fall back to the batch
+         * circuit breaker alone. */
+        {
+            uint32 maintains = 0;
+
+            if (dd->ua_DevHandle && dd->ua_DevHandle->data &&
+                dd->ua_DevHandle->data->lad_RawInterface)
+            {
+                IUSBSys->USBGetRawInterfaceAttrs(
+                    dd->ua_DevHandle->data->lad_RawInterface,
+                    USBA_HCD_MaintainsFrameNumber, &maintains,
+                    TAG_END);
+            }
+            haveFrameNo = (maintains != 0);
+
+            DPRINTF("[USBAudio] PlaySlave: HCD maintains frame number: %s\n",
+                               haveFrameNo ? "yes" : "no (using fallback only)");
+        }
+
         /* ------------------------------------------------------------------
          * Step 5: Set up staging buffer and fill initial IORequests.
          *
@@ -638,23 +721,10 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
         /* Fill and launch all IORequests */
         for (x = 0; x < iorCount; x++)
         {
-            /* Compute this IOReq's sub-frame sizes via accumulator */
-            uint32 bytesThisFrame = 0;
-            for (y = 0; y < subXfersPerIOR; y++)
-            {
-                uint32 n = baseSamples;
-                accumulator += fracNum;
-                if (accumulator >= fracDen)
-                {
-                    accumulator -= fracDen;
-                    n++;
-                }
-                uint32 subLen = n * frameSize;
-                if (subLen > maxTransferSize) subLen = maxTransferSize;
-                IUSBSys->USBSetIsoTransferSetup(iorTable[x], y,
-                    bytesThisFrame, subLen);
-                bytesThisFrame += subLen;
-            }
+            uint32 bytesThisFrame = setup_ior_sizes(IUSBSys, iorTable[x],
+                                        subXfersPerIOR, baseSamples,
+                                        fracNum, fracDen, &accumulator,
+                                        frameSize, maxTransferSize);
 
             /* Fill IOReq from staging, swapping buffers as needed */
             staging_read(AudioCtrl, &stage, (uint8 *)iorTable[x]->io_Data,
@@ -666,7 +736,11 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
             iorTable[x]->io_Actual   = subXfersPerIOR;
             iorTable[x]->io_Error    = 0;
 
+            iorLength[x]    = bytesThisFrame;
+            iorSendFrame[x] = haveFrameNo
+                            ? IUSBSys->USBGetFrameNumber(ep, NULL) : 0;
             IExec->SendIO((struct IORequest *)iorTable[x]);
+            inflight++;
 
             /* Restore the spare now that the request is on its way. */
             staging_top_up(AudioCtrl, &stage);
@@ -701,10 +775,73 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                 if (signals & usbsignal)
                 {
                     struct USBIOReq *ureq;
+                    uint32 batch    = 0;      /* completions handled this wakeup */
+                    uint32 progress = 0;      /* of which actually transferred */
 
                     while ((ureq = (struct USBIOReq *)IExec->GetMsg(usbPort)))
                     {
+                        uint32 idx;
+                        uint32 frameNow;
+
                         loop_count++;
+                        batch++;
+                        if (inflight > 0)
+                            inflight--;
+
+                        /* Map the completion back to its slot. */
+                        for (idx = 0; idx < iorCount; idx++)
+                            if (iorTable[idx] == ureq)
+                                break;
+
+                        frameNow = haveFrameNo
+                                 ? IUSBSys->USBGetFrameNumber(ep, NULL) : 0;
+
+                        /*
+                         * Detect a submission the HCD refused to schedule.
+                         *
+                         * When the endpoint's isochronous schedule is full the
+                         * EHCI HCD logs "[EHCI] EndPoint iso schedule full" and
+                         * returns *without* an error code: the IORequest comes
+                         * straight back with io_Error == USBERR_NOERROR and
+                         * nothing transferred.  Its own contract is that the
+                         * caller must retry later, once other transfers have
+                         * completed.
+                         *
+                         * Treating that as a successful transfer — which is
+                         * what this loop used to do — is what burns the CPU:
+                         * the request is refilled with fresh audio (discarding
+                         * audio that never reached the bus) and resubmitted
+                         * immediately, is refused again immediately, and the
+                         * loop spins without ever blocking in Wait().
+                         *
+                         * A genuine isochronous completion cannot occur in the
+                         * same USB frame it was submitted in: the transfer is
+                         * scheduled into a future frame and takes
+                         * FRAMES_PER_IOR milliseconds.  So an unchanged frame
+                         * number means the request was never scheduled.
+                         * Comparing for equality (rather than subtracting) is
+                         * immune to however the frame counter wraps.
+                         */
+                        if (idx < iorCount && haveFrameNo &&
+                            ureq->io_Error == USBERR_NOERROR &&
+                            frameNow == iorSendFrame[idx])
+                        {
+                            rejected_count++;
+                            if (rejected_count <= 5 ||
+                                (rejected_count & 0x3FF) == 0)
+                                DPRINTF("[USBAudio] PlaySlave: submission refused "
+                                        "#%lu (schedule full, will retry)\n",
+                                        (ULONG)rejected_count);
+
+                            /* Park it: keep its audio and transfer setups
+                             * untouched so the retry sends the same samples,
+                             * and do not advance the mixer.  Nothing was
+                             * transmitted, so nothing should be discarded. */
+                            iorParked[idx] = 1;
+                            continue;
+                        }
+
+                        progress++;
 
                         /* Handle isochronous errors gracefully.
                          *
@@ -761,24 +898,12 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                             consecutive_fatal = 0;
                         }
 
-                        /* Compute this IOReq's sub-frame sizes via accumulator */
                         {
-                            uint32 bytesThisFrame = 0;
-                            for (y = 0; y < subXfersPerIOR; y++)
-                            {
-                                uint32 n = baseSamples;
-                                accumulator += fracNum;
-                                if (accumulator >= fracDen)
-                                {
-                                    accumulator -= fracDen;
-                                    n++;
-                                }
-                                uint32 subLen = n * frameSize;
-                                if (subLen > maxTransferSize) subLen = maxTransferSize;
-                                IUSBSys->USBSetIsoTransferSetup(ureq, y,
-                                    bytesThisFrame, subLen);
-                                bytesThisFrame += subLen;
-                            }
+                            uint32 bytesThisFrame =
+                                setup_ior_sizes(IUSBSys, ureq, subXfersPerIOR,
+                                                baseSamples, fracNum, fracDen,
+                                                &accumulator, frameSize,
+                                                maxTransferSize);
 
                             /* Fill this IOReq with fresh audio from staging.
                              * This is a pure memcpy — the mixer does not run
@@ -794,13 +919,88 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                             ureq->io_Actual   = subXfersPerIOR;
                             ureq->io_Error    = 0;
 
+                            if (idx < iorCount)
+                            {
+                                iorLength[idx]    = bytesThisFrame;
+                                iorSendFrame[idx] = frameNow;
+                            }
                             IExec->SendIO((struct IORequest *)ureq);
+                            inflight++;
 
                             /* Only now, with the pipeline refilled and a full
                              * IORequest of runway ahead, run the AHI mixer to
                              * restore the spare staging buffer. */
                             staging_top_up(AudioCtrl, &stage);
                         }
+                    }
+
+                    /*
+                     * Retry parked requests.
+                     *
+                     * The HCD frees scheduling slots as transfers complete, so
+                     * the natural moment to retry is after a real completion —
+                     * which also paces the retries at FRAMES_PER_IOR ms instead
+                     * of spinning.  A retry that is refused again simply gets
+                     * re-parked and waits for the next completion.
+                     */
+                    if (iorParked && (progress > 0 || inflight == 0))
+                    {
+                        /* If nothing is in flight, no completion will ever
+                         * wake us — we must not spin.  Sleeping one tick is
+                         * coarse for audio, but the stream has already
+                         * stalled at this point and the alternative is a busy
+                         * loop at full CPU. */
+                        if (inflight == 0)
+                        {
+                            backoff_count++;
+                            if (backoff_count <= 5 ||
+                                (backoff_count & 0xFF) == 0)
+                                DPRINTF("[USBAudio] PlaySlave: pipeline stalled, "
+                                        "backing off (#%lu)\n",
+                                        (ULONG)backoff_count);
+                            IDOS->Delay(1);
+                        }
+
+                        for (x = 0; x < iorCount; x++)
+                        {
+                            if (!iorParked[x])
+                                continue;
+
+                            /* Resubmit unchanged: same samples, same setups. */
+                            iorTable[x]->io_Command  = CMD_WRITE;
+                            iorTable[x]->io_EndPoint = ep;
+                            iorTable[x]->io_Length   = iorLength[x];
+                            iorTable[x]->io_Actual   = subXfersPerIOR;
+                            iorTable[x]->io_Error    = 0;
+
+                            iorSendFrame[x] = haveFrameNo
+                                            ? IUSBSys->USBGetFrameNumber(ep, NULL)
+                                            : 0;
+                            iorParked[x] = 0;
+                            IExec->SendIO((struct IORequest *)iorTable[x]);
+                            inflight++;
+                        }
+                    }
+
+                    /*
+                     * Circuit breaker.
+                     *
+                     * Backstop for the case where rejections cannot be
+                     * identified individually (an HCD that does not maintain a
+                     * frame number, so haveFrameNo is FALSE).  A wakeup should
+                     * never yield many more completions than there are
+                     * requests; if it does, something is completing without
+                     * consuming time and the loop would spin.  Yield rather
+                     * than burn the CPU.
+                     */
+                    if (batch > iorCount * 4)
+                    {
+                        backoff_count++;
+                        if (backoff_count <= 5 || (backoff_count & 0xFF) == 0)
+                            DPRINTF("[USBAudio] PlaySlave: %lu completions in one "
+                                    "wakeup, throttling (#%lu)\n",
+                                    (ULONG)batch, (ULONG)backoff_count);
+                        IDOS->Delay(1);
                     }
                 }
             }
@@ -825,9 +1025,10 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
 
 quit:
     DPRINTF("[USBAudio] PlaySlave: exiting (loops=%lu xfer_errors=%lu "
-                       "framemissed=%lu checkresults=%lu)\n",
+                       "framemissed=%lu checkresults=%lu rejected=%lu backoff=%lu)\n",
                        (ULONG)loop_count, (ULONG)error_count,
-                       (ULONG)framemissed_count, (ULONG)checkresults_count);
+                       (ULONG)framemissed_count, (ULONG)checkresults_count,
+                       (ULONG)rejected_count, (ULONG)backoff_count);
 
     /* Free IORequests and their buffers */
     if (iorTable && IUSBSys)
@@ -843,6 +1044,10 @@ quit:
         }
         IExec->FreeVec(iorTable);
     }
+
+    IExec->FreeVec(iorSendFrame);
+    IExec->FreeVec(iorLength);
+    IExec->FreeVec(iorParked);
 
     /* Release USB system resources */
     if (IUSBSys)
