@@ -66,9 +66,13 @@
  * the Makefile so the geometry can be bisected on real hardware.
  */
 
-/* USB frames packed into each isochronous IORequest = refill deadline in ms. */
+/* USB frames packed into each isochronous IORequest = refill deadline in ms.
+ * NOTE: this also sets how *often* requests are submitted, which matters more
+ * than the buffering does — see the submission-rejection comment in the main
+ * loop.  Lowering it makes the driver submit more often, which is harmful
+ * while submissions can be rejected. */
 #ifndef FRAMES_PER_IOR
-#define FRAMES_PER_IOR 4
+#define FRAMES_PER_IOR 8
 #endif
 
 /* How many times the HCD's stated lookahead requirement to keep queued.
@@ -80,7 +84,7 @@
 
 /* Hard bounds on total frames in flight, in ms of audio. */
 #ifndef MIN_INFLIGHT_FRAMES
-#define MIN_INFLIGHT_FRAMES 8
+#define MIN_INFLIGHT_FRAMES 16
 #endif
 #ifndef MAX_INFLIGHT_FRAMES
 #define MAX_INFLIGHT_FRAMES 32
