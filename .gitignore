@@ -1,0 +1,13 @@
+# Build artifacts — everything the Makefile's `clean` target removes.
+
+# Object files
+*.o
+
+# Linked driver, its unstripped counterpart and the link map
+Source/usbaudio.audio
+Source/usbaudio.audio.debug
+Source/usbaudio.audio.map
+
+# Generated AHI mode file, and the host-side tool that generates it
+Source/USBAUDIO
+Source/gen_modefile
