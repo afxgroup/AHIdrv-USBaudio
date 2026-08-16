@@ -2135,6 +2135,7 @@ void _usbaudio_AHIsub_FreeAudio(struct USBAudioIFace    *Self,
         }
         IExec->FreeVec(dd->ua_MixBuffer);
         IExec->FreeVec(dd->ua_USBBuffer);
+        IExec->FreeVec(dd->ua_USBBuffer2);
         IExec->FreeSignal(dd->ua_MasterSignal);
         IExec->FreeVec(AudioCtrl->ahiac_DriverData);
         AudioCtrl->ahiac_DriverData = NULL;
@@ -2260,9 +2261,11 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
         }
 
         /* USB staging buffer size.
-         * Only needs to hold one AHI mix output (used as staging for
-         * the async isochronous playback).  The PlaySlave allocates
-         * its own DMA buffers for USBIOReqs. */
+         * Each buffer holds one AHI mix output.  The PlaySlave uses two of
+         * them in alternation so that the AHI mixer never has to run on the
+         * critical path between an IORequest completing and being re-sent:
+         * one buffer is consumed while the other is refilled.  The PlaySlave
+         * allocates its own DMA buffers for the USBIOReqs themselves. */
         {
             uint32 audio_bytes = AudioCtrl->ahiac_MaxBuffSamples *
                                  dd->ua_NumChannels * dd->ua_SubframeSize;
@@ -2282,9 +2285,24 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
             return AHIE_NOMEM;
         }
 
-        /* Buffers 2 and 3 no longer needed — async ISO IO uses its own
-         * per-IOReq DMA buffers allocated in the PlaySlave process. */
-        dd->ua_USBBuffer2 = NULL;
+        /* Second staging buffer — the spare half of the double buffer. */
+        if (!(dd->ua_USBBuffer2 = (uint8 *)IExec->AllocVecTags(dd->ua_USBBufferSize,
+                                                                AVT_Type, MEMF_SHARED,
+                                                                AVT_Lock, TRUE,
+                                                                AVT_Contiguous, TRUE,
+                                                                TAG_END)))
+        {
+            IExec->FreeVec(dd->ua_USBBuffer);
+            dd->ua_USBBuffer = NULL;
+            IExec->FreeVec(dd->ua_MixBuffer);
+            dd->ua_MixBuffer = NULL;
+            ILibusb1->libusb_close(dd->ua_DevHandle);
+            dd->ua_DevHandle = NULL;
+            return AHIE_NOMEM;
+        }
+
+        /* Buffer 3 not needed — async ISO IO uses its own per-IOReq DMA
+         * buffers allocated in the PlaySlave process. */
         dd->ua_USBBuffer3 = NULL;
 
         /* ---------- 4. Claim the audio streaming interface ---------- */
@@ -2297,6 +2315,8 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
             dd->ua_DevHandle = NULL;
             IExec->FreeVec(dd->ua_USBBuffer);
             dd->ua_USBBuffer = NULL;
+            IExec->FreeVec(dd->ua_USBBuffer2);
+            dd->ua_USBBuffer2 = NULL;
             IExec->FreeVec(dd->ua_MixBuffer);
             dd->ua_MixBuffer = NULL;
             return AHIE_UNKNOWN;
@@ -2322,6 +2342,8 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
             g_active_iface  = -1;
             IExec->FreeVec(dd->ua_USBBuffer);
             dd->ua_USBBuffer = NULL;
+            IExec->FreeVec(dd->ua_USBBuffer2);
+            dd->ua_USBBuffer2 = NULL;
             IExec->FreeVec(dd->ua_MixBuffer);
             dd->ua_MixBuffer = NULL;
             return AHIE_UNKNOWN;
@@ -2382,7 +2404,7 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
             NP_Entry,     (uint32)hwUSBPlaySlave,
             NP_Name,      (uint32)LIBNAME " Playback",
             NP_UserData,  AudioCtrl,
-            NP_Priority,  5,
+            NP_Priority,  11,
             NP_StackSize, 16000,
             TAG_END);
 
@@ -2728,6 +2750,8 @@ uint32 _usbaudio_AHIsub_Stop(struct USBAudioIFace    *Self,
         dd->ua_MixBuffer = NULL;
         IExec->FreeVec(dd->ua_USBBuffer);
         dd->ua_USBBuffer = NULL;
+        IExec->FreeVec(dd->ua_USBBuffer2);
+        dd->ua_USBBuffer2 = NULL;
     }
 
     /* ==================== STOP RECORDING ==================== */
@@ -2992,10 +3016,19 @@ int32 _usbaudio_AHIsub_GetAttr(struct USBAudioIFace    *Self,
          * sample frames) this driver can handle.  AHI uses this
          * together with the user's "buffer length" slider in AHI
          * Prefs to determine ahiac_BuffSamples.
-         * 16384 frames @ 48kHz = ~341ms per buffer.
+         *
+         * This is deliberately NOT set as high as the driver could
+         * technically cope with.  ahiac_BuffSamples is the amount of audio
+         * the AHI software mixer produces in one uninterruptible burst, and
+         * that burst is the longest stall the playback pipeline has to
+         * absorb.  At 16384 frames (~341ms @ 48kHz) a single mix call is
+         * long enough that, under load, it can overrun the USB pipeline and
+         * produce an audible click.  4096 frames (~85ms @ 48kHz) keeps each
+         * mix short and evenly spaced while still being far more audio than
+         * one IORequest consumes.
          */
         case AHIDB_MaxPlaySamples:
-            return 16384;
+            return 4096;
 
         default:
             return DefValue;

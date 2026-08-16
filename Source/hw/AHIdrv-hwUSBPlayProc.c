@@ -14,6 +14,11 @@
  * SendIO to pre-queue N isochronous IORequests with the Sirion USB stack.
  * When one completes, it is immediately refilled and re-sent, keeping a
  * continuous pipeline of audio data flowing to the USB device.
+ *
+ * Refilling a completed request is a plain memcpy out of a double-buffered
+ * staging area; the AHI software mixer runs only *after* the request has been
+ * re-sent, never between completion and re-send.  See the StagingCtx comment
+ * below for why that ordering matters under load.
  */
 
 #include <exec/exec.h>
@@ -40,8 +45,13 @@
 
 /* Number of USB frames packed into each isochronous IORequest.
  * More frames per IOReq = larger buffer = more time for refill.
- * 8 frames at 1ms each = 8ms per IOReq; with 2 IOReqs = 16ms total. */
-#define FRAMES_PER_IOR 8
+ * 16 frames at 1ms each = 16ms per IOReq; with 2 IOReqs = 32ms total,
+ * of which 16ms is the deadline for refilling a completed request.
+ * This is the main knob for resilience against scheduling latency
+ * (window dragging, heavy CPU load); the cost is added output latency. */
+#ifndef FRAMES_PER_IOR
+#define FRAMES_PER_IOR 16
+#endif
 
 #define dd ((struct USBAudioData *)AudioCtrl->ahiac_DriverData)
 
@@ -193,37 +203,86 @@ static uint32 mix_to_usb(struct AHIAudioCtrlDrv *AudioCtrl, uint8 *outbuf)
 }
 
 /*
- * fill_from_staging
+ * Double-buffered staging.
  *
- * Copies exactly `need` bytes into `dst`, pulling from the staging buffer and
- * re-running mix_to_usb() as many times as necessary.  The previous inline
- * version only handled a single wrap: if one IORequest needed more bytes than
- * an entire freshly-mixed staging buffer, staging_off would run past
- * staging_size and the next (staging_size - staging_off) computation would
- * underflow (unsigned), producing a huge memcpy.  Looping handles any ratio
- * between per-IOReq size and mix-buffer size.
+ * The AHI software mixer (PlayerFunc + MixerFunc, called by mix_to_usb) is by
+ * far the most expensive thing this process does, and it runs for a whole
+ * ahiac_BuffSamples worth of audio in one uninterruptible burst.  The earlier
+ * single-buffer design called it lazily, from inside the IORequest completion
+ * handler, at the exact moment the staging buffer ran dry — i.e. with only one
+ * IORequest (a few ms) of audio still queued in the USB pipeline.  Under load
+ * (dragging windows, heavy CPU) that burst could exceed the remaining runway
+ * and starve the pipe, which is what produced the intermittent clicks.
  *
- * *staging_size / *staging_off carry the staging cursor across calls.
+ * With two buffers, one is consumed while the other already holds the next
+ * mix.  staging_read() therefore never calls the mixer in normal operation:
+ * when the current buffer drains it simply swaps to the spare.  The refill is
+ * done by staging_top_up(), called from the main loop *after* the completed
+ * IORequest has been re-sent — so the mix runs at the point of maximum
+ * remaining runway rather than the minimum.
  */
-static void fill_from_staging(struct AHIAudioCtrlDrv *AudioCtrl,
-                              uint8 *dst, uint32 need,
-                              uint8 *staging,
-                              uint32 *staging_size, uint32 *staging_off)
+struct StagingCtx
+{
+    uint8  *buf[2];       /* the two staging buffers */
+    uint32  size[2];      /* valid bytes in each */
+    uint32  cur;          /* index currently being consumed */
+    uint32  off;          /* read offset into buf[cur] */
+    BOOL    spare_ready;  /* buf[cur ^ 1] holds a fresh, unconsumed mix */
+};
+
+/*
+ * staging_top_up
+ *
+ * Refills the spare buffer if it is not already loaded.  No-op otherwise, so
+ * it is safe (and intended) to call this after every send.
+ */
+static void staging_top_up(struct AHIAudioCtrlDrv *AudioCtrl,
+                           struct StagingCtx *sc)
+{
+    uint32 spare;
+
+    if (sc->spare_ready)
+        return;
+
+    spare = sc->cur ^ 1;
+    sc->size[spare] = mix_to_usb(AudioCtrl, sc->buf[spare]);
+    sc->spare_ready = TRUE;
+}
+
+/*
+ * staging_read
+ *
+ * Copies exactly `need` bytes into `dst`, swapping buffers as they drain.
+ *
+ * The loop handles any ratio between per-IOReq size and mix-buffer size: if a
+ * single IORequest needs more than one whole staging buffer it will swap more
+ * than once.  That is also the only case in which the mixer is called from
+ * here (via the staging_top_up fallback) — mixing inline is still better than
+ * emitting silence.
+ */
+static void staging_read(struct AHIAudioCtrlDrv *AudioCtrl,
+                         struct StagingCtx *sc, uint8 *dst, uint32 need)
 {
     uint32 done = 0;
 
     while (done < need)
     {
-        uint32 remaining = *staging_size - *staging_off;
+        uint32 remaining = sc->size[sc->cur] - sc->off;
+        uint32 chunk;
 
         if (remaining == 0)
         {
-            /* Staging exhausted — produce a fresh mix buffer */
-            *staging_size = mix_to_usb(AudioCtrl, staging);
-            *staging_off  = 0;
-            /* Guard against a mixer that returns 0 bytes (avoid infinite
+            /* Current buffer drained — switch to the spare.  If the top-up
+             * did not happen in time, mix now rather than emit silence. */
+            staging_top_up(AudioCtrl, sc);
+
+            sc->cur         = sc->cur ^ 1;
+            sc->off         = 0;
+            sc->spare_ready = FALSE;
+
+            /* Guard against a mixer that returns 0 bytes (avoid an infinite
              * loop): zero-fill the rest and bail. */
-            if (*staging_size == 0)
+            if (sc->size[sc->cur] == 0)
             {
                 memset(dst + done, 0, need - done);
                 return;
@@ -231,13 +290,13 @@ static void fill_from_staging(struct AHIAudioCtrlDrv *AudioCtrl,
             continue;
         }
 
-        uint32 chunk = need - done;
+        chunk = need - done;
         if (chunk > remaining)
             chunk = remaining;
 
-        memcpy(dst + done, staging + *staging_off, chunk);
-        done         += chunk;
-        *staging_off += chunk;
+        memcpy(dst + done, sc->buf[sc->cur] + sc->off, chunk);
+        done    += chunk;
+        sc->off += chunk;
     }
 }
 
@@ -268,10 +327,8 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
     struct UsbEndPoint *ep        = NULL;
     BOOL               deviceOpen = FALSE;
 
-    /* Staging buffer for AHI mix output */
-    uint8  *staging     = NULL;
-    uint32  staging_size = 0;   /* bytes produced by last mix_to_usb */
-    uint32  staging_off  = 0;   /* current read offset into staging */
+    /* Double-buffered staging area for AHI mix output */
+    struct StagingCtx stage = { { NULL, NULL }, { 0, 0 }, 0, 0, FALSE };
 
     AudioCtrl = (struct AHIAudioCtrlDrv *)sysbase->ThisTask->tc_UserData;
 
@@ -493,18 +550,28 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
         /* ------------------------------------------------------------------
          * Step 5: Set up staging buffer and fill initial IORequests.
          *
-         * Use ua_USBBuffer as the staging area for mix_to_usb output.
-         * As IOReqs are filled, we consume data from staging and call
-         * mix_to_usb again when the staging buffer runs out.
+         * ua_USBBuffer / ua_USBBuffer2 are the two halves of the staging
+         * double buffer.  Both are primed here so the pipeline starts with a
+         * full spare and the mixer is never on the critical path.
          * ------------------------------------------------------------------ */
-        staging = dd->ua_USBBuffer;
+        if (!dd->ua_USBBuffer || !dd->ua_USBBuffer2)
+        {
+            DPRINTF("[USBAudio] PlaySlave: staging buffers not allocated!\n");
+            goto quit;
+        }
 
-        /* First mix to fill the staging buffer */
-        staging_size = mix_to_usb(AudioCtrl, staging);
-        staging_off  = 0;
+        stage.buf[0] = dd->ua_USBBuffer;
+        stage.buf[1] = dd->ua_USBBuffer2;
+        stage.cur    = 0;
+        stage.off    = 0;
 
-        DPRINTF("[USBAudio] PlaySlave: first mix produced %lu bytes\n",
-                           (ULONG)staging_size);
+        /* Prime the buffer we will consume first, then the spare. */
+        stage.size[0]     = mix_to_usb(AudioCtrl, stage.buf[0]);
+        stage.spare_ready = FALSE;
+        staging_top_up(AudioCtrl, &stage);
+
+        DPRINTF("[USBAudio] PlaySlave: primed staging (%lu + %lu bytes)\n",
+                           (ULONG)stage.size[0], (ULONG)stage.size[1]);
 
         /* Fill and launch all IORequests */
         for (x = 0; x < iorCount; x++)
@@ -527,10 +594,9 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                 bytesThisFrame += subLen;
             }
 
-            /* Fill IOReq from staging, wrapping to next mix as needed */
-            fill_from_staging(AudioCtrl, (uint8 *)iorTable[x]->io_Data,
-                              bytesThisFrame, staging,
-                              &staging_size, &staging_off);
+            /* Fill IOReq from staging, swapping buffers as needed */
+            staging_read(AudioCtrl, &stage, (uint8 *)iorTable[x]->io_Data,
+                         bytesThisFrame);
 
             iorTable[x]->io_Command  = CMD_WRITE;
             iorTable[x]->io_EndPoint = ep;
@@ -539,6 +605,9 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
             iorTable[x]->io_Error    = 0;
 
             IExec->SendIO((struct IORequest *)iorTable[x]);
+
+            /* Restore the spare now that the request is on its way. */
+            staging_top_up(AudioCtrl, &stage);
         }
 
         DPRINTF("[USBAudio] PlaySlave: all %lu IORequests launched\n",
@@ -619,10 +688,12 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                                 bytesThisFrame += subLen;
                             }
 
-                            /* Fill this IOReq with fresh audio from staging */
-                            fill_from_staging(AudioCtrl, (uint8 *)ureq->io_Data,
-                                              bytesThisFrame, staging,
-                                              &staging_size, &staging_off);
+                            /* Fill this IOReq with fresh audio from staging.
+                             * This is a pure memcpy — the mixer does not run
+                             * here, so the time between completion and
+                             * re-send stays short and predictable. */
+                            staging_read(AudioCtrl, &stage,
+                                         (uint8 *)ureq->io_Data, bytesThisFrame);
 
                             /* Re-send immediately */
                             ureq->io_Command  = CMD_WRITE;
@@ -632,6 +703,11 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                             ureq->io_Error    = 0;
 
                             IExec->SendIO((struct IORequest *)ureq);
+
+                            /* Only now, with the pipeline refilled and a full
+                             * IORequest of runway ahead, run the AHI mixer to
+                             * restore the spare staging buffer. */
+                            staging_top_up(AudioCtrl, &stage);
                         }
                     }
                 }
