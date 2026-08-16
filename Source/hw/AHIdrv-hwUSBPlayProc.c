@@ -37,20 +37,53 @@
 #include <string.h>
 #include "includes/AHIdrv-USBaudio.h"
 
-/* NOTE: the number of in-flight IORequests is intentionally driven by the
- * HCD's USBA_HCD_CachedIsochronousFrames (clamped to a minimum of 2 below),
- * NOT by a fixed count — exceeding what the HCD can schedule causes
- * "[EHCI] EndPoint iso schedule full" and corrupts the pipe.  Timing
- * resilience instead comes from packing FRAMES_PER_IOR frames per request. */
+/*
+ * Isochronous pipeline geometry.
+ *
+ * USBA_HCD_CachedIsochronousFrames is a count of USB *frames*, not of
+ * IORequests: it is how far ahead, in 1ms frames, the HCD needs transfers
+ * queued in order to keep its cache fed (see usbsys.doc, USBGetEndPointAttrs).
+ *
+ * The earlier code used it directly as the number of IORequests and then
+ * packed FRAMES_PER_IOR frames into each one, so the number of frames
+ * actually placed in the endpoint's schedule was cachedFrames *
+ * FRAMES_PER_IOR — up to an order of magnitude more than intended.  That is
+ * what provokes the HCD's "[EHCI] EndPoint iso schedule full (by node)": the
+ * per-endpoint schedule node cannot hold that many frames, and the condition
+ * shows up in bursts, because after a scheduling stall (dragging a window)
+ * every in-flight request completes at once and is resubmitted back-to-back.
+ *
+ * So the budget is expressed in frames and then divided into requests:
+ *
+ *   total frames in flight = cachedFrames * SCHEDULE_DEPTH_FACTOR
+ *                            (clamped to [MIN_INFLIGHT_FRAMES,
+ *                                         MAX_INFLIGHT_FRAMES])
+ *   iorCount               = total frames / FRAMES_PER_IOR   (at least 2)
+ *
+ * FRAMES_PER_IOR sets the refill deadline (one completed request must be
+ * refilled within FRAMES_PER_IOR milliseconds); the total frame count sets how
+ * much audio is buffered against a stall.  All four knobs are overridable from
+ * the Makefile so the geometry can be bisected on real hardware.
+ */
 
-/* Number of USB frames packed into each isochronous IORequest.
- * More frames per IOReq = larger buffer = more time for refill.
- * 16 frames at 1ms each = 16ms per IOReq; with 2 IOReqs = 32ms total,
- * of which 16ms is the deadline for refilling a completed request.
- * This is the main knob for resilience against scheduling latency
- * (window dragging, heavy CPU load); the cost is added output latency. */
+/* USB frames packed into each isochronous IORequest = refill deadline in ms. */
 #ifndef FRAMES_PER_IOR
-#define FRAMES_PER_IOR 16
+#define FRAMES_PER_IOR 4
+#endif
+
+/* How many times the HCD's stated lookahead requirement to keep queued.
+ * 1 is the documented minimum; more buys resilience at the cost of schedule
+ * occupancy and output latency. */
+#ifndef SCHEDULE_DEPTH_FACTOR
+#define SCHEDULE_DEPTH_FACTOR 2
+#endif
+
+/* Hard bounds on total frames in flight, in ms of audio. */
+#ifndef MIN_INFLIGHT_FRAMES
+#define MIN_INFLIGHT_FRAMES 8
+#endif
+#ifndef MAX_INFLIGHT_FRAMES
+#define MAX_INFLIGHT_FRAMES 32
 #endif
 
 #define dd ((struct USBAudioData *)AudioCtrl->ahiac_DriverData)
@@ -317,6 +350,8 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
     uint32 loop_count = 0;
     uint32 error_count = 0;
     uint32 consecutive_fatal = 0;  /* consecutive fatal USB errors (device removed) */
+    uint32 framemissed_count = 0;  /* USBERR_FRAMEMISSED: audio never reached the bus */
+    uint32 checkresults_count = 0; /* USBERR_CHECKRESULTS: partial sub-transfer failure */
 
     /* Local USB resources — opened and freed entirely within this process */
     struct MsgPort    *usbPort    = NULL;
@@ -430,6 +465,7 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
         uint32 cachedFrames    = 0;
         uint32 maxTransferSize = 0;
         uint32 transfersPerFrame = 0;
+        uint32 wantIors;         /* IORequests the schedule budget allows */
         uint32 maxIsoChunkSize;  /* max bytes per IOReq (for allocation) */
         uint32 frameSize;        /* bytes per sample frame: channels * subframeSize */
         uint32 baseSamples;      /* floor(sampleRate / (TPF * 1000)) per sub-frame */
@@ -450,14 +486,41 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                            (ULONG)cachedFrames, (ULONG)maxTransferSize,
                            (ULONG)transfersPerFrame);
 
-        /* Use at least 2 IOReqs for double-buffering, but do NOT exceed
-         * what the HCD can schedule — exceeding cachedFrames causes
-         * "[EHCI] EndPoint iso schedule full" and corrupts the pipe. */
-        if (cachedFrames < 2)
-            cachedFrames = 2;
+        if (cachedFrames < 1)
+            cachedFrames = 1;
 
         if (transfersPerFrame == 0)
             transfersPerFrame = 1;
+
+        /* Turn the HCD's frame lookahead requirement into a request count.
+         * See the geometry comment at the top of this file: the budget is in
+         * frames, and iorCount * FRAMES_PER_IOR must stay inside it or the
+         * endpoint's schedule node overflows. */
+        {
+            uint32 inflightFrames = cachedFrames * SCHEDULE_DEPTH_FACTOR;
+
+            if (inflightFrames < MIN_INFLIGHT_FRAMES)
+                inflightFrames = MIN_INFLIGHT_FRAMES;
+            if (inflightFrames > MAX_INFLIGHT_FRAMES)
+                inflightFrames = MAX_INFLIGHT_FRAMES;
+
+            /* The cap must never starve the HCD: if this controller wants
+             * more lookahead than the cap allows, the HCD requirement wins,
+             * otherwise the stream underruns by construction. */
+            if (inflightFrames < cachedFrames)
+                inflightFrames = cachedFrames;
+
+            wantIors = inflightFrames / FRAMES_PER_IOR;
+            if (wantIors < 2)
+                wantIors = 2;   /* need at least double buffering */
+
+            DPRINTF("[USBAudio] PlaySlave: cachedFrames=%lu -> budget %lu frames "
+                    "-> %lu IOReqs x %lu frames (%lu ms buffered, %lu ms deadline)\n",
+                    (ULONG)cachedFrames, (ULONG)inflightFrames, (ULONG)wantIors,
+                    (ULONG)FRAMES_PER_IOR,
+                    (ULONG)(wantIors * FRAMES_PER_IOR),
+                    (ULONG)FRAMES_PER_IOR);
+        }
 
         /*
          * For output: use a fractional accumulator to maintain the correct
@@ -477,19 +540,14 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
 
         maxIsoChunkSize = maxTransferSize * transfersPerFrame;
 
-        /* Pack multiple USB frames per IORequest for timing resilience.
-         * With cachedFrames=1, each IOReq of 1 frame gives only ~1ms
-         * margin for refill — causing clicks when mix callbacks are slow.
-         * Packing 8 frames per IOReq gives ~8ms margin. */
         subXfersPerIOR = FRAMES_PER_IOR * transfersPerFrame;
         iorBufSize     = FRAMES_PER_IOR * maxIsoChunkSize;
 
-        DPRINTF("[USBAudio] PlaySlave: frameSize=%lu baseSamples=%lu fracNum=%lu/%lu framesPerIOR=%lu iorCount=%lu\n",
+        DPRINTF("[USBAudio] PlaySlave: frameSize=%lu baseSamples=%lu fracNum=%lu/%lu\n",
                            (ULONG)frameSize, (ULONG)baseSamples,
-                           (ULONG)fracNum, (ULONG)fracDen,
-                           (ULONG)FRAMES_PER_IOR, (ULONG)cachedFrames);
+                           (ULONG)fracNum, (ULONG)fracDen);
 
-        if (maxIsoChunkSize == 0 || cachedFrames == 0 || baseSamples == 0)
+        if (maxIsoChunkSize == 0 || baseSamples == 0)
         {
             DPRINTF("[USBAudio] PlaySlave: invalid isochronous parameters!\n");
             goto quit;
@@ -503,7 +561,7 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
          * offsets/lengths are updated dynamically before each SendIO.
          * ------------------------------------------------------------------ */
         iorTable = (struct USBIOReq **)IExec->AllocVecTags(
-                       sizeof(struct USBIOReq *) * (cachedFrames + 1),
+                       sizeof(struct USBIOReq *) * (wantIors + 1),
                        AVT_ClearWithValue, 0,
                        TAG_END);
         if (!iorTable)
@@ -512,7 +570,7 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
             goto quit;
         }
 
-        for (x = 0; x < cachedFrames; x++)
+        for (x = 0; x < wantIors; x++)
         {
             iorTable[x] = IUSBSys->USBAllocRequest((struct IORequest *)baseReq, TAG_END);
             if (!iorTable[x])
@@ -542,7 +600,7 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
             /* Set reply port for async completions */
             ((struct IORequest *)iorTable[x])->io_Message.mn_ReplyPort = usbPort;
         }
-        iorCount = cachedFrames;
+        iorCount = wantIors;
 
         DPRINTF("[USBAudio] PlaySlave: allocated %lu IORequests (%lu bytes, %lu subXfers each)\n",
                            (ULONG)iorCount, (ULONG)iorBufSize, (ULONG)subXfersPerIOR);
@@ -644,10 +702,40 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                     {
                         loop_count++;
 
-                        /* Handle isochronous errors gracefully */
+                        /* Handle isochronous errors gracefully.
+                         *
+                         * USBERR_FRAMEMISSED is not benign: it means the
+                         * request's target frame had already passed and the
+                         * audio in it was never put on the bus — an audible
+                         * dropout.  It is not fatal (the stream recovers on
+                         * the next request) so playback continues, but it is
+                         * counted and reported: a rising count is the direct
+                         * signal that the pipeline is not being refilled in
+                         * time, and it correlates with the HCD logging
+                         * "[EHCI] EndPoint iso schedule full". */
                         if (ureq->io_Error != USBERR_NOERROR)
                         {
-                            if (ureq->io_Error != -37 && ureq->io_Error != -38)
+                            if (ureq->io_Error == USBERR_FRAMEMISSED)
+                            {
+                                framemissed_count++;
+                                consecutive_fatal = 0;
+                                /* Rate-limited: log the first few, then every
+                                 * 256th, so a persistent problem stays visible
+                                 * without flooding the log. */
+                                if (framemissed_count <= 5 ||
+                                    (framemissed_count & 0xFF) == 0)
+                                    DPRINTF("[USBAudio] PlaySlave: FRAMEMISSED #%lu "
+                                            "(audio dropped, pipeline late)\n",
+                                            (ULONG)framemissed_count);
+                            }
+                            else if (ureq->io_Error == USBERR_CHECKRESULTS)
+                            {
+                                /* Some sub-transfers failed; the rest went
+                                 * out.  Partial loss, stream stays valid. */
+                                checkresults_count++;
+                                consecutive_fatal = 0;
+                            }
+                            else
                             {
                                 error_count++;
                                 consecutive_fatal++;
@@ -732,8 +820,10 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
     }
 
 quit:
-    DPRINTF("[USBAudio] PlaySlave: exiting (loops=%lu xfer_errors=%lu)\n",
-                       (ULONG)loop_count, (ULONG)error_count);
+    DPRINTF("[USBAudio] PlaySlave: exiting (loops=%lu xfer_errors=%lu "
+                       "framemissed=%lu checkresults=%lu)\n",
+                       (ULONG)loop_count, (ULONG)error_count,
+                       (ULONG)framemissed_count, (ULONG)checkresults_count);
 
     /* Free IORequests and their buffers */
     if (iorTable && IUSBSys)

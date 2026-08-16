@@ -23,7 +23,11 @@ INCPATH = -I. -I$(INCDIR)
 # Compiler flags
 OPTIMIZE = -O3 -fomit-frame-pointer
 #DEBUG   = -gstabs -DDEBUG
-CFLAGS   = -mcrt=$(CRT) -mstrict-align -Wall -Wwrite-strings $(DEBUG) $(OPTIMIZE) $(INCPATH)
+# Extra flags for tuning experiments, e.g.
+#   make clean && make TUNE="-DFRAMES_PER_IOR=8 -DSCHEDULE_DEPTH_FACTOR=1"
+TUNE ?=
+
+CFLAGS   = -mcrt=$(CRT) -mstrict-align -Wall -Wwrite-strings $(DEBUG) $(OPTIMIZE) $(INCPATH) $(TUNE)
 
 # Linker flags — shared library, no C startup
 LINK = -mcrt=$(CRT) -nostartfiles
