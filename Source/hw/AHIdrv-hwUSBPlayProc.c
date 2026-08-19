@@ -399,6 +399,8 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
     uint32 framemissed_count = 0;  /* USBERR_FRAMEMISSED: audio never reached the bus */
     uint32 checkresults_count = 0; /* USBERR_CHECKRESULTS: partial sub-transfer failure */
     uint32 rejected_count = 0;     /* submissions the HCD refused to schedule */
+    uint32 bytes_sent = 0;         /* bytes the hardware reports as transferred */
+    uint32 last_report = 0;        /* loop_count at last status line */
     uint32 backoff_count = 0;      /* times the circuit breaker had to sleep */
 
     /* Local USB resources — opened and freed entirely within this process */
@@ -701,6 +703,16 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
             }
             haveFrameNo = (maintains != 0);
 
+#ifdef DISABLE_REJECT_DETECT
+            /* Escape hatch: build with -DDISABLE_REJECT_DETECT to turn the
+             * refused-submission detector off and fall back to the plain
+             * "always refill and resend" behaviour.  Use it to establish
+             * whether the detector itself is misclassifying good transfers. */
+            haveFrameNo = FALSE;
+            LPRINTF("[USBAudio] PlaySlave: refused-submission detector DISABLED "
+                    "at build time\n");
+#endif
+
             DPRINTF("[USBAudio] PlaySlave: HCD maintains frame number: %s\n",
                                haveFrameNo ? "yes" : "no (using fallback only)");
         }
@@ -844,9 +856,20 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                             rejected_count++;
                             if (rejected_count <= 5 ||
                                 (rejected_count & 0x3FF) == 0)
+                            {
                                 DPRINTF("[USBAudio] PlaySlave: submission refused "
                                         "#%lu (schedule full, will retry)\n",
                                         (ULONG)rejected_count);
+                                /* Frame numbers included: if they are always
+                                 * equal because the HCD reports a constant (or
+                                 * zero) frame number, this detector is
+                                 * misfiring and every transfer is being parked
+                                 * for no reason. */
+                                LPRINTF("[USBAudio] PlaySlave: submission refused #%lu "
+                                        "(sendFrame=%lu nowFrame=%lu)\n",
+                                        (ULONG)rejected_count,
+                                        (ULONG)iorSendFrame[idx], (ULONG)frameNow);
+                            }
 
                             /* Park it: keep its audio and transfer setups
                              * untouched so the retry sends the same samples,
@@ -857,6 +880,21 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                         }
 
                         progress++;
+
+                        /* Sum what the hardware says it actually put on the
+                         * bus.  Transfers that "succeed" while moving zero
+                         * bytes look identical to working audio from the
+                         * outside, and sound like silence. */
+                        {
+                            uint32 sx;
+                            for (sx = 0; sx < subXfersPerIOR; sx++)
+                            {
+                                struct USBTransferResult *res =
+                                    IUSBSys->USBGetIsoTransferResult(ureq, sx, NULL);
+                                if (res)
+                                    bytes_sent += res->Actual;
+                            }
+                        }
 
                         /* Handle isochronous errors gracefully.
                          *
@@ -951,6 +989,20 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                              * restore the spare staging buffer. */
                             staging_top_up(AudioCtrl, &stage);
                         }
+                    }
+
+                    /* Periodic status: the single line that says whether
+                     * audio data is actually reaching the device. */
+                    if (loop_count - last_report >= 500)
+                    {
+                        last_report = loop_count;
+                        LPRINTF("[USBAudio] PlaySlave: status loops=%lu sent=%luKB "
+                                "rejected=%lu framemissed=%lu err=%lu backoff=%lu "
+                                "inflight=%lu\n",
+                                (ULONG)loop_count, (ULONG)(bytes_sent >> 10),
+                                (ULONG)rejected_count, (ULONG)framemissed_count,
+                                (ULONG)error_count, (ULONG)backoff_count,
+                                (ULONG)inflight);
                     }
 
                     /*
