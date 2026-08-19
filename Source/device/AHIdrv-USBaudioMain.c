@@ -2288,6 +2288,16 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
                            (LONG)dd->ua_AltSetting, (LONG)dd->ua_MaxPacketSize,
                            (LONG)dd->ua_NumChannels, (LONG)dd->ua_SubframeSize);
 
+        /* discover_usb_audio_details() re-reads the descriptor blob over a
+         * control transfer; if that fails these values silently fall back to
+         * defaults that do not match the hardware. */
+        LPRINTF("[USBAudio] Start: after discover EP=0x%02lx Ifc=%ld Alt=%ld "
+                "MaxPkt=%ld Ch=%ld Sub=%ld RateCtrl=%ld\n",
+                (LONG)dd->ua_EndpointAddr, (LONG)dd->ua_InterfaceNum,
+                (LONG)dd->ua_AltSetting, (LONG)dd->ua_MaxPacketSize,
+                (LONG)dd->ua_NumChannels, (LONG)dd->ua_SubframeSize,
+                (LONG)dd->ua_RateCtrl);
+
         /* ---------- 3. Allocate mix/USB buffers ---------- */
         /* Done AFTER discover so that channel-count, subframe size and
          * max-packet-size are the real device values. */
@@ -2354,6 +2364,8 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
                            (LONG)dd->ua_InterfaceNum, r);
         if (r != LIBUSB_SUCCESS)
         {
+            LPRINTF("[USBAudio] Start: claim_interface(%ld) FAILED (%ld)\n",
+                    (LONG)dd->ua_InterfaceNum, (LONG)r);
             ILibusb1->libusb_close(dd->ua_DevHandle);
             dd->ua_DevHandle = NULL;
             IExec->FreeVec(dd->ua_USBBuffer);
@@ -2378,6 +2390,8 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
         if (r != LIBUSB_SUCCESS)
         {
             DPRINTF("[USBAudio] Start: set_alt_setting FAILED (%ld), aborting\n", r);
+            LPRINTF("[USBAudio] Start: set_alt_setting(ifc=%ld alt=%ld) FAILED (%ld)\n",
+                    (LONG)dd->ua_InterfaceNum, (LONG)dd->ua_AltSetting, (LONG)r);
             ILibusb1->libusb_release_interface(dd->ua_DevHandle, dd->ua_InterfaceNum);
             ILibusb1->libusb_close(dd->ua_DevHandle);
             dd->ua_DevHandle = NULL;

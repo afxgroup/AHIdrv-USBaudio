@@ -505,6 +505,10 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
     {
         DPRINTF("[USBAudio] PlaySlave: could not get UsbEndPoint for EP 0x%02lx\n",
                            (ULONG)dd->ua_EndpointAddr);
+        LPRINTF("[USBAudio] PlaySlave: FAILED to resolve UsbEndPoint 0x%02lx "
+                "(lad_Interface=%p) - no audio will play\n",
+                (ULONG)dd->ua_EndpointAddr,
+                dd->ua_DevHandle ? dd->ua_DevHandle->data->lad_Interface : NULL);
         goto quit;
     }
 
@@ -538,6 +542,12 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
         DPRINTF("[USBAudio] PlaySlave: cachedFrames=%lu maxXferSize=%lu xfersPerFrame=%lu\n",
                            (ULONG)cachedFrames, (ULONG)maxTransferSize,
                            (ULONG)transfersPerFrame);
+
+        LPRINTF("[USBAudio] PlaySlave: iso params cachedFrames=%lu "
+                "maxXferSize=%lu xfersPerFrame=%lu speed=%lu\n",
+                (ULONG)cachedFrames, (ULONG)maxTransferSize,
+                (ULONG)transfersPerFrame,
+                (ULONG)(dd->ua_DevHandle ? dd->ua_DevHandle->dev->speed : 0));
 
         if (cachedFrames < 1)
             cachedFrames = 1;
@@ -603,6 +613,9 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
         if (maxIsoChunkSize == 0 || baseSamples == 0)
         {
             DPRINTF("[USBAudio] PlaySlave: invalid isochronous parameters!\n");
+            LPRINTF("[USBAudio] PlaySlave: INVALID iso params "
+                    "(chunk=%lu baseSamples=%lu) - no audio will play\n",
+                    (ULONG)maxIsoChunkSize, (ULONG)baseSamples);
             goto quit;
         }
 
@@ -748,6 +761,8 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
 
         DPRINTF("[USBAudio] PlaySlave: all %lu IORequests launched\n",
                            (ULONG)iorCount);
+        LPRINTF("[USBAudio] PlaySlave: streaming started, %lu IOReqs x %lu frames\n",
+                (ULONG)iorCount, (ULONG)FRAMES_PER_IOR);
 
         /* Tell master we are alive */
         IExec->Signal((struct Task *)dd->ua_MasterTask, 1L << dd->ua_MasterSignal);
@@ -881,8 +896,12 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                                 error_count++;
                                 consecutive_fatal++;
                                 if (error_count <= 5)
+                                {
                                     DPRINTF("[USBAudio] PlaySlave: io_Error=%ld (fatal #%lu)\n",
                                                        (LONG)ureq->io_Error, (ULONG)consecutive_fatal);
+                                    LPRINTF("[USBAudio] PlaySlave: transfer error %ld (#%lu)\n",
+                                            (LONG)ureq->io_Error, (ULONG)consecutive_fatal);
+                                }
                                 /* Device removed or dead — stop playing */
                                 if (consecutive_fatal >= 3)
                                 {

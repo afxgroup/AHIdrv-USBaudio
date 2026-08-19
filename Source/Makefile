@@ -21,7 +21,7 @@ INCDIR = ../../libusb-1/SDK/local/common/include/
 INCPATH = -I. -I$(INCDIR) 
 
 # Compiler flags
-OPTIMIZE = -O3 -fomit-frame-pointer
+OPTIMIZE = -O2
 #DEBUG   = -gstabs -DDEBUG
 # Extra flags for tuning experiments, e.g.
 #   make clean && make TUNE="-DFRAMES_PER_IOR=8 -DSCHEDULE_DEPTH_FACTOR=1"
