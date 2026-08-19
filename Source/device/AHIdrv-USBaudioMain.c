@@ -1032,6 +1032,7 @@ void scan_usb_audio_device(void)
 {
     libusb_device **list = NULL;
     int32 cnt, i;
+    static int32 skip_logged = 0;
 
     if (g_usb_num_devices > 0 && g_usb_info.found)
         return;
@@ -1044,15 +1045,34 @@ void scan_usb_audio_device(void)
      * prints, flooding the serial console and freezing the UI.
      */
     if (g_usb_info.scanned && !g_usb_info.found && !g_force_rescan)
+    {
+        /* Logged once only: AHI calls this in a retry loop and an
+         * unconditional print here would flood the serial console. */
+        if (!skip_logged)
+        {
+            skip_logged = 1;
+            LPRINTF("[USBAudio] scan: SKIPPED - an earlier scan found no audio "
+                    "card and no rescan was requested.  A card that finished "
+                    "enumerating after that first scan (e.g. behind a hub) "
+                    "will not be picked up.\n");
+        }
         return;
+    }
+
+    skip_logged = 0;
+    LPRINTF("[USBAudio] scan: entering scan (scanned=%ld found=%ld forced=%ld)\n",
+            (LONG)g_usb_info.scanned, (LONG)g_usb_info.found,
+            (LONG)g_force_rescan);
 
     /* Wait for STACKFULLBOOTED once — never again after that. */
     if (!g_stack_booted)
     {
         DPRINTF("[USBAudio] scan: waiting for USB stack full-boot...\n");
+        LPRINTF("[USBAudio] scan: waiting for USB stack full-boot...\n");
         wait_usb_stack_fullbooted();
         g_stack_booted = 1;
         DPRINTF("[USBAudio] scan: USB stack ready\n");
+        LPRINTF("[USBAudio] scan: USB stack reported ready\n");
     }
 
     /* Lazy-open libusb-1.library on first scan.
@@ -1083,6 +1103,7 @@ void scan_usb_audio_device(void)
         else
         {
             DPRINTF("[USBAudio] scan: cannot open libusb-1.library\n");
+            LPRINTF("[USBAudio] scan: FAILED to open libusb-1.library\n");
             return;
         }
     }
@@ -1118,8 +1139,14 @@ void scan_usb_audio_device(void)
     if (cnt <= 0 || list == NULL)
     {
         DPRINTF("[USBAudio] No USB devices found!\n");
+        LPRINTF("[USBAudio] scan: NO USB devices at all "
+                "(libusb_get_device_list returned %ld) -> no audio cards\n",
+                (LONG)cnt);
         return;
     }
+
+    LPRINTF("[USBAudio] scan: %ld USB device(s) on the bus, looking for audio\n",
+            (LONG)cnt);
 
     for (i = 0; list[i] != NULL; i++)
     {
@@ -1523,15 +1550,31 @@ void scan_usb_audio_device(void)
     if (g_usb_num_devices == 0)
     {
         DPRINTF("[USBAudio] scan_usb_audio_device: NO USB Audio device found! :-(\n");
+        LPRINTF("[USBAudio] scan: RESULT = no USB audio card found "
+                "(%ld USB device(s) examined)\n", (LONG)cnt);
         g_usb_info.found = 0;
     }
     else
     {
+        int32 li;
+
         /* Copy first device as default active device */
         g_usb_info = g_usb_devices[0];
         g_usb_info.scanned = 1;  /* Preserve: struct copy overwrites it */
         DPRINTF("[USBAudio] scan_usb_audio_device: %ld device(s) found, default=\"%s\"\n",
                            (LONG)g_usb_num_devices, g_usb_info.name);
+
+        LPRINTF("[USBAudio] scan: RESULT = %ld USB audio card(s) found\n",
+                (LONG)g_usb_num_devices);
+        for (li = 0; li < g_usb_num_devices; li++)
+            LPRINTF("[USBAudio]   card %ld: %04lx:%04lx \"%s\" "
+                    "playEP=0x%02lx recEP=0x%02lx\n",
+                    (LONG)li,
+                    (ULONG)g_usb_devices[li].vid,
+                    (ULONG)g_usb_devices[li].pid,
+                    g_usb_devices[li].name,
+                    (ULONG)g_usb_devices[li].ep_addr,
+                    (ULONG)g_usb_devices[li].rec_ep_addr);
     }
 
     /* ---- Build flattened output/input arrays for AHI Prefs ---- */
@@ -2397,18 +2440,13 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
                 DPRINTF("[USBAudio] Start: SET_CUR sample rate OK\n");
         }
 
-        /* Create the playback slave process */
-        IExec->Forbid();
-
         dd->ua_SlaveTask = IDOS->CreateNewProcTags(
             NP_Entry,     (uint32)hwUSBPlaySlave,
             NP_Name,      (uint32)LIBNAME " Playback",
             NP_UserData,  AudioCtrl,
-            NP_Priority,  11,
+            NP_Priority,  51,
             NP_StackSize, 16000,
             TAG_END);
-
-        IExec->Permit();
 
         if (dd->ua_SlaveTask)
         {
@@ -2574,7 +2612,6 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
         dd->ua_IsRecording = TRUE;
 
         /* Create the recording slave process */
-        IExec->Forbid();
 
         dd->ua_RecSlaveTask = IDOS->CreateNewProcTags(
             NP_Entry,     (uint32)hwUSBRecordSlave,
@@ -2583,8 +2620,6 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
             NP_Priority,  1,
             NP_StackSize, 16000,
             TAG_END);
-
-        IExec->Permit();
 
         if (dd->ua_RecSlaveTask)
         {
