@@ -795,8 +795,21 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
 
         DPRINTF("[USBAudio] PlaySlave: all %lu IORequests launched\n",
                            (ULONG)iorCount);
-        LPRINTF("[USBAudio] PlaySlave: streaming started, %lu IOReqs x %lu frames\n",
-                (ULONG)iorCount, (ULONG)FRAMES_PER_IOR);
+        /* Report the payload actually programmed per frame, and say plainly
+         * whether this is a clamped diagnostic build.  Without this there is
+         * no way to tell from a log which binary produced it. */
+        LPRINTF("[USBAudio] PlaySlave: streaming started, %lu IOReqs x %lu frames, "
+                "%lu bytes/frame"
+#ifdef DIAG_MAX_FRAME_BYTES
+                "  *** DIAG BUILD: payload clamped to %lu bytes ***"
+#endif
+                "\n",
+                (ULONG)iorCount, (ULONG)FRAMES_PER_IOR,
+                (ULONG)(baseSamples * frameSize)
+#ifdef DIAG_MAX_FRAME_BYTES
+                , (ULONG)DIAG_MAX_FRAME_BYTES
+#endif
+                );
 
         /* Tell master we are alive */
         IExec->Signal((struct Task *)dd->ua_MasterTask, 1L << dd->ua_MasterSignal);
