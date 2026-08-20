@@ -244,6 +244,46 @@ static void make_device_name(struct USBAudioDeviceInfo *dev)
 }
 
 /*
+ * add_fallback_rate
+ *
+ * Insert 44100 Hz into a rate list unless it is already present, keeping the
+ * list in ascending order.  Returns the new entry count.
+ *
+ * A full-speed isochronous OUT of more than 188 bytes per frame takes the EHCI
+ * multi-split path, which does not deliver, so a card behind a high-speed hub
+ * is silent at 48 kHz stereo 16-bit (192 bytes per frame).  44.1 kHz needs 176
+ * and stays on the single-split path that works.  Cards reporting the USB
+ * Audio sampling frequency control generally honour a SET_CUR for 44.1 kHz
+ * whether or not they declare it.
+ *
+ * This must be applied to the per-output-mode lists, not only the device-level
+ * one: selecting an output overwrites g_usb_info.frequencies from the chosen
+ * mode, so a rate added only at device level is invisible to AHI.
+ */
+static int32 add_fallback_rate(uint32 *freqs, int32 nfreq)
+{
+    int32 fi, pos;
+
+    for (fi = 0; fi < nfreq; fi++)
+        if (freqs[fi] == 44100)
+            return nfreq;
+
+    if (nfreq >= MAX_USB_FREQUENCIES)
+        return nfreq;
+
+    /* Ascending insert: AHI's rate picker and the closest-match snapping in
+     * AHIsub_AllocAudio both walk this list in order. */
+    for (pos = 0; pos < nfreq && freqs[pos] < 44100; pos++)
+        ;
+    for (fi = nfreq; fi > pos; fi--)
+        freqs[fi] = freqs[fi - 1];
+    freqs[pos] = 44100;
+
+    return nfreq + 1;
+}
+
+
+/*
  * enumerate_device_modes
  *
  * Opens a USB device briefly during scan to read its raw configuration
@@ -677,10 +717,11 @@ static void enumerate_device_modes(libusb_device *usbdev,
                 out->subframe_size  = best_play_sub;
                 out->bit_resolution = best_play_bits;
                 out->channel_offset = 0;
-                out->num_frequencies = best_play_nfreq;
                 out->rate_ctrl      = (uint8)best_play_rate_ctrl;
                 for (fi = 0; fi < best_play_nfreq && fi < MAX_USB_FREQUENCIES; fi++)
                     out->frequencies[fi] = best_play_freq[fi];
+                out->num_frequencies = add_fallback_rate(out->frequencies,
+                                                         best_play_nfreq);
 
                 for (ni = 0; ni < (int32)(sizeof(ot_names)/sizeof(ot_names[0])); ni++)
                     if (ot_names[ni].type == enum_ot[oi].type)
@@ -732,10 +773,11 @@ static void enumerate_device_modes(libusb_device *usbdev,
                 out->subframe_size  = best_play_sub;
                 out->bit_resolution = best_play_bits;
                 out->channel_offset = pair_map[pi].offset;
-                out->num_frequencies = best_play_nfreq;
                 out->rate_ctrl      = (uint8)best_play_rate_ctrl;
                 for (fi = 0; fi < best_play_nfreq && fi < MAX_USB_FREQUENCIES; fi++)
                     out->frequencies[fi] = best_play_freq[fi];
+                out->num_frequencies = add_fallback_rate(out->frequencies,
+                                                         best_play_nfreq);
 
                 mname = pair_map[pi].name;
                 for (k = 0; mname[k] && k < 47; k++)
@@ -1505,40 +1547,10 @@ void scan_usb_audio_device(void)
                 /* Enumerate all output modes and input sources from raw config descriptor */
                 enumerate_device_modes(list[i], dev);
 
-                /* Offer 44.1 kHz even when the card does not advertise it.
-                 *
-                 * A full-speed isochronous OUT larger than 188 bytes per frame
-                 * takes the EHCI multi-split path, which does not deliver, so
-                 * a card behind a high-speed hub is silent at 48 kHz stereo
-                 * 16-bit (192 bytes/frame).  44.1 kHz needs 176 and stays on
-                 * the single-split path that works.
-                 *
-                 * Cards that report the USB Audio sampling frequency control
-                 * generally honour a SET_CUR for 44.1 kHz whether or not they
-                 * list it, and this one does.  Adding it costs nothing when it
-                 * is unnecessary - the user picks the rate in AHI Prefs, and
-                 * the declared rates are still all there. */
-                {
-                    int32 fi;
-                    int32 present = 0;
-
-                    for (fi = 0; fi < dev->num_frequencies; fi++)
-                        if (dev->frequencies[fi] == 44100)
-                            present = 1;
-
-                    if (!present && dev->num_frequencies < MAX_USB_FREQUENCIES)
-                    {
-                        /* Keep the list ascending: AHI's rate picker and the
-                         * closest-match snapping in AllocAudio both walk it
-                         * in order. */
-                        for (fi = dev->num_frequencies; fi > 0; fi--)
-                            dev->frequencies[fi] = dev->frequencies[fi - 1];
-                        dev->frequencies[0] = 44100;
-                        dev->num_frequencies++;
-
-                        DPRINTF("[USBAudio] added 44100 Hz (not declared by card)\n");
-                    }
-                }
+                /* Same fallback at device level, for the case where no
+                 * output mode was enumerated.  See add_fallback_rate(). */
+                dev->num_frequencies = add_fallback_rate(dev->frequencies,
+                                                         dev->num_frequencies);
 
                 /* Deduplicate: skip if config descriptor matches a previous device
                    (Sirion USB stack bug returns same handle for different USB addresses) */
