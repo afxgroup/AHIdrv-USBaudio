@@ -1051,7 +1051,7 @@ void scan_usb_audio_device(void)
         if (!skip_logged)
         {
             skip_logged = 1;
-            LPRINTF("[USBAudio] scan: SKIPPED - an earlier scan found no audio "
+            DPRINTF("[USBAudio] scan: SKIPPED - an earlier scan found no audio "
                     "card and no rescan was requested.  A card that finished "
                     "enumerating after that first scan (e.g. behind a hub) "
                     "will not be picked up.\n");
@@ -1060,7 +1060,7 @@ void scan_usb_audio_device(void)
     }
 
     skip_logged = 0;
-    LPRINTF("[USBAudio] scan: entering scan (scanned=%ld found=%ld forced=%ld)\n",
+    DPRINTF("[USBAudio] scan: entering scan (scanned=%ld found=%ld forced=%ld)\n",
             (LONG)g_usb_info.scanned, (LONG)g_usb_info.found,
             (LONG)g_force_rescan);
 
@@ -1068,11 +1068,11 @@ void scan_usb_audio_device(void)
     if (!g_stack_booted)
     {
         DPRINTF("[USBAudio] scan: waiting for USB stack full-boot...\n");
-        LPRINTF("[USBAudio] scan: waiting for USB stack full-boot...\n");
+        DPRINTF("[USBAudio] scan: waiting for USB stack full-boot...\n");
         wait_usb_stack_fullbooted();
         g_stack_booted = 1;
         DPRINTF("[USBAudio] scan: USB stack ready\n");
-        LPRINTF("[USBAudio] scan: USB stack reported ready\n");
+        DPRINTF("[USBAudio] scan: USB stack reported ready\n");
     }
 
     /* Lazy-open libusb-1.library on first scan.
@@ -1103,7 +1103,7 @@ void scan_usb_audio_device(void)
         else
         {
             DPRINTF("[USBAudio] scan: cannot open libusb-1.library\n");
-            LPRINTF("[USBAudio] scan: FAILED to open libusb-1.library\n");
+            DPRINTF("[USBAudio] scan: FAILED to open libusb-1.library\n");
             return;
         }
     }
@@ -1139,13 +1139,13 @@ void scan_usb_audio_device(void)
     if (cnt <= 0 || list == NULL)
     {
         DPRINTF("[USBAudio] No USB devices found!\n");
-        LPRINTF("[USBAudio] scan: NO USB devices at all "
+        DPRINTF("[USBAudio] scan: NO USB devices at all "
                 "(libusb_get_device_list returned %ld) -> no audio cards\n",
                 (LONG)cnt);
         return;
     }
 
-    LPRINTF("[USBAudio] scan: %ld USB device(s) on the bus, looking for audio\n",
+    DPRINTF("[USBAudio] scan: %ld USB device(s) on the bus, looking for audio\n",
             (LONG)cnt);
 
     for (i = 0; list[i] != NULL; i++)
@@ -1505,44 +1505,40 @@ void scan_usb_audio_device(void)
                 /* Enumerate all output modes and input sources from raw config descriptor */
                 enumerate_device_modes(list[i], dev);
 
-#ifdef FORCE_EXTRA_RATE
-                /* Offer a sample rate the card does not advertise.
+                /* Offer 44.1 kHz even when the card does not advertise it.
                  *
                  * A full-speed isochronous OUT larger than 188 bytes per frame
                  * takes the EHCI multi-split path, which does not deliver, so
                  * a card behind a high-speed hub is silent at 48 kHz stereo
                  * 16-bit (192 bytes/frame).  44.1 kHz needs 176 and stays on
-                 * the working single-split path.
+                 * the single-split path that works.
                  *
-                 * This card declares 48 kHz only, but it does report the USB
-                 * Audio sampling frequency control, so it may still accept a
-                 * SET_CUR for another rate.  If it does, this is a real fix.
-                 * If it STALLs the request it keeps running at 48 kHz while
-                 * being fed 44.1 kHz data, and playback comes out sharp -
-                 * audible either way, which is what makes it worth trying. */
+                 * Cards that report the USB Audio sampling frequency control
+                 * generally honour a SET_CUR for 44.1 kHz whether or not they
+                 * list it, and this one does.  Adding it costs nothing when it
+                 * is unnecessary - the user picks the rate in AHI Prefs, and
+                 * the declared rates are still all there. */
                 {
                     int32 fi;
                     int32 present = 0;
 
                     for (fi = 0; fi < dev->num_frequencies; fi++)
-                        if (dev->frequencies[fi] == FORCE_EXTRA_RATE)
+                        if (dev->frequencies[fi] == 44100)
                             present = 1;
 
                     if (!present && dev->num_frequencies < MAX_USB_FREQUENCIES)
                     {
-                        /* Keep it first: AHI's rate picker and the closest-match
-                         * snapping in AllocAudio both walk this list in order. */
+                        /* Keep the list ascending: AHI's rate picker and the
+                         * closest-match snapping in AllocAudio both walk it
+                         * in order. */
                         for (fi = dev->num_frequencies; fi > 0; fi--)
                             dev->frequencies[fi] = dev->frequencies[fi - 1];
-                        dev->frequencies[0] = FORCE_EXTRA_RATE;
+                        dev->frequencies[0] = 44100;
                         dev->num_frequencies++;
 
-                        LPRINTF("[USBAudio] *** FORCED RATE %lu Hz added "
-                                "(card declares it not) ***\n",
-                                (ULONG)FORCE_EXTRA_RATE);
+                        DPRINTF("[USBAudio] added 44100 Hz (not declared by card)\n");
                     }
                 }
-#endif
 
                 /* Deduplicate: skip if config descriptor matches a previous device
                    (Sirion USB stack bug returns same handle for different USB addresses) */
@@ -1589,7 +1585,7 @@ void scan_usb_audio_device(void)
     if (g_usb_num_devices == 0)
     {
         DPRINTF("[USBAudio] scan_usb_audio_device: NO USB Audio device found! :-(\n");
-        LPRINTF("[USBAudio] scan: RESULT = no USB audio card found "
+        DPRINTF("[USBAudio] scan: RESULT = no USB audio card found "
                 "(%ld USB device(s) examined)\n", (LONG)cnt);
         g_usb_info.found = 0;
     }
@@ -1603,13 +1599,13 @@ void scan_usb_audio_device(void)
         DPRINTF("[USBAudio] scan_usb_audio_device: %ld device(s) found, default=\"%s\"\n",
                            (LONG)g_usb_num_devices, g_usb_info.name);
 
-        LPRINTF("[USBAudio] scan: RESULT = %ld USB audio card(s) found\n",
+        DPRINTF("[USBAudio] scan: RESULT = %ld USB audio card(s) found\n",
                 (LONG)g_usb_num_devices);
         for (li = 0; li < g_usb_num_devices; li++)
         {
             int32 fi;
 
-            LPRINTF("[USBAudio]   card %ld: %04lx:%04lx \"%s\" "
+            DPRINTF("[USBAudio]   card %ld: %04lx:%04lx \"%s\" "
                     "playEP=0x%02lx recEP=0x%02lx\n",
                     (LONG)li,
                     (ULONG)g_usb_devices[li].vid,
@@ -1624,17 +1620,17 @@ void scan_usb_audio_device(void)
              * deliver.  48 kHz stereo 16-bit is 192 bytes and fails; 44.1 kHz
              * is 176 and works.  Whether that escape exists is entirely up to
              * what this list contains. */
-            LPRINTF("[USBAudio]   card %ld: %ld rate(s):", (LONG)li,
+            DPRINTF("[USBAudio]   card %ld: %ld rate(s):", (LONG)li,
                     (LONG)g_usb_devices[li].num_frequencies);
             for (fi = 0; fi < g_usb_devices[li].num_frequencies; fi++)
-                LPRINTF(" %lu", (ULONG)g_usb_devices[li].frequencies[fi]);
-            LPRINTF("  (bytes/frame at each: ");
+                DPRINTF(" %lu", (ULONG)g_usb_devices[li].frequencies[fi]);
+            DPRINTF("  (bytes/frame at each: ");
             for (fi = 0; fi < g_usb_devices[li].num_frequencies; fi++)
-                LPRINTF("%lu ",
+                DPRINTF("%lu ",
                         (ULONG)((g_usb_devices[li].frequencies[fi] / 1000) *
                                 g_usb_devices[li].nr_channels *
                                 g_usb_devices[li].subframe_size));
-            LPRINTF("- limit is 188)\n");
+            DPRINTF("- limit is 188)\n");
         }
     }
 
@@ -2352,7 +2348,7 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
         /* discover_usb_audio_details() re-reads the descriptor blob over a
          * control transfer; if that fails these values silently fall back to
          * defaults that do not match the hardware. */
-        LPRINTF("[USBAudio] Start: after discover EP=0x%02lx Ifc=%ld Alt=%ld "
+        DPRINTF("[USBAudio] Start: after discover EP=0x%02lx Ifc=%ld Alt=%ld "
                 "MaxPkt=%ld Ch=%ld Sub=%ld RateCtrl=%ld\n",
                 (LONG)dd->ua_EndpointAddr, (LONG)dd->ua_InterfaceNum,
                 (LONG)dd->ua_AltSetting, (LONG)dd->ua_MaxPacketSize,
@@ -2425,7 +2421,7 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
                            (LONG)dd->ua_InterfaceNum, r);
         if (r != LIBUSB_SUCCESS)
         {
-            LPRINTF("[USBAudio] Start: claim_interface(%ld) FAILED (%ld)\n",
+            DPRINTF("[USBAudio] Start: claim_interface(%ld) FAILED (%ld)\n",
                     (LONG)dd->ua_InterfaceNum, (LONG)r);
             ILibusb1->libusb_close(dd->ua_DevHandle);
             dd->ua_DevHandle = NULL;
@@ -2451,7 +2447,7 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
         if (r != LIBUSB_SUCCESS)
         {
             DPRINTF("[USBAudio] Start: set_alt_setting FAILED (%ld), aborting\n", r);
-            LPRINTF("[USBAudio] Start: set_alt_setting(ifc=%ld alt=%ld) FAILED (%ld)\n",
+            DPRINTF("[USBAudio] Start: set_alt_setting(ifc=%ld alt=%ld) FAILED (%ld)\n",
                     (LONG)dd->ua_InterfaceNum, (LONG)dd->ua_AltSetting, (LONG)r);
             ILibusb1->libusb_release_interface(dd->ua_DevHandle, dd->ua_InterfaceNum);
             ILibusb1->libusb_close(dd->ua_DevHandle);
@@ -2514,13 +2510,13 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
                 /* Decisive when a rate is being forced: a refusal here means
                  * the card keeps its own rate while we feed it another, so
                  * playback comes out at the wrong pitch. */
-                LPRINTF("[USBAudio] Start: SET_CUR %lu Hz REFUSED (%ld) - card "
+                DPRINTF("[USBAudio] Start: SET_CUR %lu Hz REFUSED (%ld) - card "
                         "keeps its own rate\n", (ULONG)rate, (LONG)r);
             }
             else
             {
                 DPRINTF("[USBAudio] Start: SET_CUR sample rate OK\n");
-                LPRINTF("[USBAudio] Start: SET_CUR %lu Hz accepted\n",
+                DPRINTF("[USBAudio] Start: SET_CUR %lu Hz accepted\n",
                         (ULONG)rate);
             }
         }

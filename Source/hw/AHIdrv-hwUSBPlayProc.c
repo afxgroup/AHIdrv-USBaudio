@@ -372,27 +372,6 @@ static uint32 setup_ior_sizes(struct USBSysIFace *IUSBSys, struct USBIOReq *ureq
         if (subLen > maxTransferSize)
             subLen = maxTransferSize;
 
-#ifdef DIAG_MAX_FRAME_BYTES
-        /* DIAGNOSTIC ONLY - not a fix.
-         *
-         * The EHCI host controller splits a full-speed isochronous OUT into
-         * 188-byte start-split transactions
-         * (EHCI_MAX_ISO_SPLIT_PAYLOAD_BYTES in the HCD's isochronous.c).  At
-         * or below 188 bytes per frame it emits a single split
-         * (XACT_POS_ALL); above it, a multi-split sequence.  48 kHz stereo
-         * 16-bit needs 192 bytes per frame, so it always takes the
-         * multi-split path — and that path is only used when the card sits
-         * behind a high-speed hub, because a full-speed card on a root port
-         * is handed to the companion OHCI/UHCI controller instead.
-         *
-         * Clamping the payload below the boundary forces the single-split
-         * path.  It underfeeds the device by a few samples per frame, so
-         * playback runs slightly flat and drifts; that is fine for a test.
-         * Audio appearing behind a hub with this defined, and not without,
-         * places the fault in the multi-split path. */
-        if (subLen > DIAG_MAX_FRAME_BYTES)
-            subLen = DIAG_MAX_FRAME_BYTES;
-#endif
 
         IUSBSys->USBSetIsoTransferSetup(ureq, y, bytesThisFrame, subLen);
         bytesThisFrame += subLen;
@@ -529,7 +508,7 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
     {
         DPRINTF("[USBAudio] PlaySlave: could not get UsbEndPoint for EP 0x%02lx\n",
                            (ULONG)dd->ua_EndpointAddr);
-        LPRINTF("[USBAudio] PlaySlave: FAILED to resolve UsbEndPoint 0x%02lx "
+        DPRINTF("[USBAudio] PlaySlave: FAILED to resolve UsbEndPoint 0x%02lx "
                 "(lad_Interface=%p) - no audio will play\n",
                 (ULONG)dd->ua_EndpointAddr,
                 dd->ua_DevHandle ? dd->ua_DevHandle->data->lad_Interface : NULL);
@@ -567,7 +546,7 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                            (ULONG)cachedFrames, (ULONG)maxTransferSize,
                            (ULONG)transfersPerFrame);
 
-        LPRINTF("[USBAudio] PlaySlave: iso params cachedFrames=%lu "
+        DPRINTF("[USBAudio] PlaySlave: iso params cachedFrames=%lu "
                 "maxXferSize=%lu xfersPerFrame=%lu speed=%lu\n",
                 (ULONG)cachedFrames, (ULONG)maxTransferSize,
                 (ULONG)transfersPerFrame,
@@ -637,7 +616,7 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
         if (maxIsoChunkSize == 0 || baseSamples == 0)
         {
             DPRINTF("[USBAudio] PlaySlave: invalid isochronous parameters!\n");
-            LPRINTF("[USBAudio] PlaySlave: INVALID iso params "
+            DPRINTF("[USBAudio] PlaySlave: INVALID iso params "
                     "(chunk=%lu baseSamples=%lu) - no audio will play\n",
                     (ULONG)maxIsoChunkSize, (ULONG)baseSamples);
             goto quit;
@@ -725,15 +704,6 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
             }
             haveFrameNo = (maintains != 0);
 
-#ifdef DISABLE_REJECT_DETECT
-            /* Escape hatch: build with -DDISABLE_REJECT_DETECT to turn the
-             * refused-submission detector off and fall back to the plain
-             * "always refill and resend" behaviour.  Use it to establish
-             * whether the detector itself is misclassifying good transfers. */
-            haveFrameNo = FALSE;
-            LPRINTF("[USBAudio] PlaySlave: refused-submission detector DISABLED "
-                    "at build time\n");
-#endif
 
             DPRINTF("[USBAudio] PlaySlave: HCD maintains frame number: %s\n",
                                haveFrameNo ? "yes" : "no (using fallback only)");
@@ -798,18 +768,10 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
         /* Report the payload actually programmed per frame, and say plainly
          * whether this is a clamped diagnostic build.  Without this there is
          * no way to tell from a log which binary produced it. */
-        LPRINTF("[USBAudio] PlaySlave: streaming started, %lu IOReqs x %lu frames, "
-                "%lu bytes/frame"
-#ifdef DIAG_MAX_FRAME_BYTES
-                "  *** DIAG BUILD: payload clamped to %lu bytes ***"
-#endif
-                "\n",
+        DPRINTF("[USBAudio] PlaySlave: streaming started, %lu IOReqs x %lu frames, "
+                "%lu bytes/frame\n",
                 (ULONG)iorCount, (ULONG)FRAMES_PER_IOR,
-                (ULONG)(baseSamples * frameSize)
-#ifdef DIAG_MAX_FRAME_BYTES
-                , (ULONG)DIAG_MAX_FRAME_BYTES
-#endif
-                );
+                (ULONG)(baseSamples * frameSize));
 
         /* Tell master we are alive */
         IExec->Signal((struct Task *)dd->ua_MasterTask, 1L << dd->ua_MasterSignal);
@@ -900,7 +862,7 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                                  * zero) frame number, this detector is
                                  * misfiring and every transfer is being parked
                                  * for no reason. */
-                                LPRINTF("[USBAudio] PlaySlave: submission refused #%lu "
+                                DPRINTF("[USBAudio] PlaySlave: submission refused #%lu "
                                         "(sendFrame=%lu nowFrame=%lu)\n",
                                         (ULONG)rejected_count,
                                         (ULONG)iorSendFrame[idx], (ULONG)frameNow);
@@ -972,7 +934,7 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                                 {
                                     DPRINTF("[USBAudio] PlaySlave: io_Error=%ld (fatal #%lu)\n",
                                                        (LONG)ureq->io_Error, (ULONG)consecutive_fatal);
-                                    LPRINTF("[USBAudio] PlaySlave: transfer error %ld (#%lu)\n",
+                                    DPRINTF("[USBAudio] PlaySlave: transfer error %ld (#%lu)\n",
                                             (LONG)ureq->io_Error, (ULONG)consecutive_fatal);
                                 }
                                 /* Device removed or dead — stop playing */
@@ -1031,7 +993,7 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                     if (loop_count - last_report >= 500)
                     {
                         last_report = loop_count;
-                        LPRINTF("[USBAudio] PlaySlave: status loops=%lu sent=%luKB "
+                        DPRINTF("[USBAudio] PlaySlave: status loops=%lu sent=%luKB "
                                 "rejected=%lu framemissed=%lu err=%lu backoff=%lu "
                                 "inflight=%lu\n",
                                 (ULONG)loop_count, (ULONG)(bytes_sent >> 10),

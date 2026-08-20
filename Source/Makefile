@@ -23,7 +23,10 @@ INCPATH = -I. -I$(INCDIR)
 # Compiler flags
 OPTIMIZE = -O2
 #DEBUG   = -gstabs -DDEBUG
-# Extra flags for tuning experiments, e.g.
+# Uncomment DEBUG below (or pass DEBUG=-DDEBUG on the command line) for a
+# build with the driver's diagnostic output on the serial console.
+#
+# Extra flags for pipeline tuning, e.g.
 #   make clean && make TUNE="-DFRAMES_PER_IOR=8 -DSCHEDULE_DEPTH_FACTOR=1"
 TUNE ?=
 
@@ -46,31 +49,9 @@ OBJS = \
 
 ###################################################################
 
-.PHONY: all clean install diag
+.PHONY: all clean install
 
 all: $(TARGET) $(MODEFILE)
-
-# Build the normal driver plus the 188-byte clamp diagnostic side by side into
-# Source/builds/.  The clamp build announces itself in its own log line, so a
-# capture can always be traced back to the binary that produced it.
-# Note: `all` is named explicitly in the recursive calls -- a bare $(MAKE)
-# would re-enter this target, since make builds the first rule in the file.
-diag:
-	$(MAKE) clean
-	$(MAKE) all TUNE="-DDIAG_MAX_FRAME_BYTES=188"
-	mkdir -p builds
-	cp $(TARGET) builds/$(TARGET).DIAG-clamp188
-	$(MAKE) clean
-	$(MAKE) all
-	cp $(TARGET) builds/$(TARGET).NORMALE
-	$(MAKE) clean
-	$(MAKE) all TUNE="-DFORCE_EXTRA_RATE=44100"
-	cp $(TARGET) builds/$(TARGET).FORCE44100
-	$(MAKE) clean
-	$(MAKE) all
-	@echo ""
-	@echo "Builds written to Source/builds/:"
-	@ls -l builds/
 
 $(TARGET): $(OBJS)
 	$(CC) $(LINK) -o $(TARGET).debug $(OBJS) -Wl,--cref,-M,-Map=$@.map

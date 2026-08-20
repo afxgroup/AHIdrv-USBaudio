@@ -16,12 +16,6 @@
 #define DPRINTF(...) ((void)0)
 #endif
 
-/* Always-on log macro — NOT controlled by -DDEBUG.
- * Reserved for the handful of messages needed to diagnose a driver that
- * finds no hardware in the field, where shipping a debug build first is not
- * practical.  Keep the number of these very small. */
-#define LPRINTF IExec->DebugPrintF
-
 #define LIBNAME  "usbaudio.audio"
 
 #define MAX_USB_FREQUENCIES 24

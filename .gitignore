@@ -12,5 +12,3 @@ Source/usbaudio.audio.map
 Source/USBAUDIO
 Source/gen_modefile
 
-# Local diagnostic builds produced by `make diag` — kept on disk, out of git
-Source/builds/
