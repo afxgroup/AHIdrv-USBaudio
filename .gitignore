@@ -11,3 +11,6 @@ Source/usbaudio.audio.map
 # Generated AHI mode file, and the host-side tool that generates it
 Source/USBAUDIO
 Source/gen_modefile
+
+# Local diagnostic builds produced by `make diag` — kept on disk, out of git
+Source/builds/
