@@ -22,10 +22,12 @@ INCPATH = -I. -I$(INCDIR)
 
 # Compiler flags
 OPTIMIZE = -O2
+
+# Uncomment the DEBUG line below, or pass DEBUG=-DDEBUG on the command line,
+# for a build that writes the driver's diagnostics to the serial console.
+# Left commented the driver logs nothing at all.
 #DEBUG   = -gstabs -DDEBUG
-# Uncomment DEBUG below (or pass DEBUG=-DDEBUG on the command line) for a
-# build with the driver's diagnostic output on the serial console.
-#
+
 # Extra flags for pipeline tuning, e.g.
 #   make clean && make TUNE="-DFRAMES_PER_IOR=8 -DSCHEDULE_DEPTH_FACTOR=1"
 TUNE ?=
