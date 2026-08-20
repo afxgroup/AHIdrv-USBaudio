@@ -63,6 +63,11 @@ diag:
 	$(MAKE) clean
 	$(MAKE) all
 	cp $(TARGET) builds/$(TARGET).NORMALE
+	$(MAKE) clean
+	$(MAKE) all TUNE="-DFORCE_EXTRA_RATE=44100"
+	cp $(TARGET) builds/$(TARGET).FORCE44100
+	$(MAKE) clean
+	$(MAKE) all
 	@echo ""
 	@echo "Builds written to Source/builds/:"
 	@ls -l builds/

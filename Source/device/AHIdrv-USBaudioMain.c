@@ -1505,6 +1505,45 @@ void scan_usb_audio_device(void)
                 /* Enumerate all output modes and input sources from raw config descriptor */
                 enumerate_device_modes(list[i], dev);
 
+#ifdef FORCE_EXTRA_RATE
+                /* Offer a sample rate the card does not advertise.
+                 *
+                 * A full-speed isochronous OUT larger than 188 bytes per frame
+                 * takes the EHCI multi-split path, which does not deliver, so
+                 * a card behind a high-speed hub is silent at 48 kHz stereo
+                 * 16-bit (192 bytes/frame).  44.1 kHz needs 176 and stays on
+                 * the working single-split path.
+                 *
+                 * This card declares 48 kHz only, but it does report the USB
+                 * Audio sampling frequency control, so it may still accept a
+                 * SET_CUR for another rate.  If it does, this is a real fix.
+                 * If it STALLs the request it keeps running at 48 kHz while
+                 * being fed 44.1 kHz data, and playback comes out sharp -
+                 * audible either way, which is what makes it worth trying. */
+                {
+                    int32 fi;
+                    int32 present = 0;
+
+                    for (fi = 0; fi < dev->num_frequencies; fi++)
+                        if (dev->frequencies[fi] == FORCE_EXTRA_RATE)
+                            present = 1;
+
+                    if (!present && dev->num_frequencies < MAX_USB_FREQUENCIES)
+                    {
+                        /* Keep it first: AHI's rate picker and the closest-match
+                         * snapping in AllocAudio both walk this list in order. */
+                        for (fi = dev->num_frequencies; fi > 0; fi--)
+                            dev->frequencies[fi] = dev->frequencies[fi - 1];
+                        dev->frequencies[0] = FORCE_EXTRA_RATE;
+                        dev->num_frequencies++;
+
+                        LPRINTF("[USBAudio] *** FORCED RATE %lu Hz added "
+                                "(card declares it not) ***\n",
+                                (ULONG)FORCE_EXTRA_RATE);
+                    }
+                }
+#endif
+
                 /* Deduplicate: skip if config descriptor matches a previous device
                    (Sirion USB stack bug returns same handle for different USB addresses) */
                 {
@@ -2471,9 +2510,19 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
                     DPRINTF("[USBAudio] Start: SET_CUR sample rate not accepted (STALL) - device uses fixed hardware rate\n");
                 else
                     DPRINTF("[USBAudio] Start: SET_CUR sample rate failed: %ld\n", r);
+
+                /* Decisive when a rate is being forced: a refusal here means
+                 * the card keeps its own rate while we feed it another, so
+                 * playback comes out at the wrong pitch. */
+                LPRINTF("[USBAudio] Start: SET_CUR %lu Hz REFUSED (%ld) - card "
+                        "keeps its own rate\n", (ULONG)rate, (LONG)r);
             }
             else
+            {
                 DPRINTF("[USBAudio] Start: SET_CUR sample rate OK\n");
+                LPRINTF("[USBAudio] Start: SET_CUR %lu Hz accepted\n",
+                        (ULONG)rate);
+            }
         }
 
         dd->ua_SlaveTask = IDOS->CreateNewProcTags(
