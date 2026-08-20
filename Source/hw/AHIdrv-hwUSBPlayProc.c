@@ -372,6 +372,28 @@ static uint32 setup_ior_sizes(struct USBSysIFace *IUSBSys, struct USBIOReq *ureq
         if (subLen > maxTransferSize)
             subLen = maxTransferSize;
 
+#ifdef DIAG_MAX_FRAME_BYTES
+        /* DIAGNOSTIC ONLY - not a fix.
+         *
+         * The EHCI host controller splits a full-speed isochronous OUT into
+         * 188-byte start-split transactions
+         * (EHCI_MAX_ISO_SPLIT_PAYLOAD_BYTES in the HCD's isochronous.c).  At
+         * or below 188 bytes per frame it emits a single split
+         * (XACT_POS_ALL); above it, a multi-split sequence.  48 kHz stereo
+         * 16-bit needs 192 bytes per frame, so it always takes the
+         * multi-split path — and that path is only used when the card sits
+         * behind a high-speed hub, because a full-speed card on a root port
+         * is handed to the companion OHCI/UHCI controller instead.
+         *
+         * Clamping the payload below the boundary forces the single-split
+         * path.  It underfeeds the device by a few samples per frame, so
+         * playback runs slightly flat and drifts; that is fine for a test.
+         * Audio appearing behind a hub with this defined, and not without,
+         * places the fault in the multi-split path. */
+        if (subLen > DIAG_MAX_FRAME_BYTES)
+            subLen = DIAG_MAX_FRAME_BYTES;
+#endif
+
         IUSBSys->USBSetIsoTransferSetup(ureq, y, bytesThisFrame, subLen);
         bytesThisFrame += subLen;
     }
