@@ -1567,6 +1567,9 @@ void scan_usb_audio_device(void)
         LPRINTF("[USBAudio] scan: RESULT = %ld USB audio card(s) found\n",
                 (LONG)g_usb_num_devices);
         for (li = 0; li < g_usb_num_devices; li++)
+        {
+            int32 fi;
+
             LPRINTF("[USBAudio]   card %ld: %04lx:%04lx \"%s\" "
                     "playEP=0x%02lx recEP=0x%02lx\n",
                     (LONG)li,
@@ -1575,6 +1578,25 @@ void scan_usb_audio_device(void)
                     g_usb_devices[li].name,
                     (ULONG)g_usb_devices[li].ep_addr,
                     (ULONG)g_usb_devices[li].rec_ep_addr);
+
+            /* The sample rates the card itself declares.  Decisive for the
+             * hub problem: a full-speed isochronous OUT of more than 188
+             * bytes per frame takes the EHCI multi-split path, which does not
+             * deliver.  48 kHz stereo 16-bit is 192 bytes and fails; 44.1 kHz
+             * is 176 and works.  Whether that escape exists is entirely up to
+             * what this list contains. */
+            LPRINTF("[USBAudio]   card %ld: %ld rate(s):", (LONG)li,
+                    (LONG)g_usb_devices[li].num_frequencies);
+            for (fi = 0; fi < g_usb_devices[li].num_frequencies; fi++)
+                LPRINTF(" %lu", (ULONG)g_usb_devices[li].frequencies[fi]);
+            LPRINTF("  (bytes/frame at each: ");
+            for (fi = 0; fi < g_usb_devices[li].num_frequencies; fi++)
+                LPRINTF("%lu ",
+                        (ULONG)((g_usb_devices[li].frequencies[fi] / 1000) *
+                                g_usb_devices[li].nr_channels *
+                                g_usb_devices[li].subframe_size));
+            LPRINTF("- limit is 188)\n");
+        }
     }
 
     /* ---- Build flattened output/input arrays for AHI Prefs ---- */
