@@ -2565,6 +2565,10 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
                                     ((uint32)rb[1] << 8) |
                                     ((uint32)rb[2] << 16);
 
+                    /* Only ever consumed by DPRINTF, which is a no-op in a
+                     * release build. */
+                    (void)actual;
+
                     DPRINTF("[USBAudio] Start: card reports actual rate %lu Hz "
                             "(asked for %lu)%s\n",
                             (ULONG)actual, (ULONG)rate,

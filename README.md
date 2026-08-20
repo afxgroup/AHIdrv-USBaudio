@@ -19,6 +19,7 @@ Hotplug (attach/detach without reboot) is handled in cooperation with [`usbaudio
 - Volume/gain control via Feature Unit (GET_MIN / GET_MAX / GET_RES / GET_CUR / SET_CUR)
 - Volume range cached after first query — no repeated USB control transfers on re-open
 - SET_CUR sample rate (UAC 1.0 endpoint frequency control)
+- 44.1 kHz always offered as a fallback rate — see *Sample rate and USB hubs* below
 - Hotplug: safe detach during active playback — no freeze on device removal
 - Serial debug output guarded by `#ifdef DEBUG` (zero overhead in release builds)
 - User-defined device names via `ENVARC:USBAudio.prefs`
@@ -60,6 +61,73 @@ When the USB device is physically removed during playback:
 ### Async isochronous pipeline
 
 The playback and recording slaves use `SendIO` to pre-queue multiple `USBIOReq` isochronous requests with the USB stack (modelled after *usbaudio2* by Chris Handley). When one request completes, it is immediately refilled and re-sent, maintaining a continuous pipeline that is resilient to task scheduling jitter.
+
+## Sample rate and USB hubs
+
+**If audio is silent when the card is connected through a USB hub, select
+44100 Hz in AHI Prefs.**
+
+This is the driver working around a defect in the AmigaOS EHCI host controller
+driver, not a limitation of the card. The rest of this section explains why,
+since the symptom is confusing and easy to misdiagnose.
+
+### The symptom
+
+A full-speed USB Audio card plays correctly on a root port and is completely
+silent behind a high-speed hub. Enumeration, descriptors, interface claiming
+and alternate-setting selection are all identical in both cases. Every
+isochronous transfer completes with `USBERR_NOERROR`, the reported transferred
+byte counts are identical to the working case, and nothing appears in any log.
+
+### The cause
+
+The EHCI host controller splits a full-speed isochronous OUT transfer into
+188-byte start-split transactions (`EHCI_MAX_ISO_SPLIT_PAYLOAD_BYTES` in the
+HCD's `isochronous.c`). At or below 188 bytes per USB frame it issues a single
+start-split; above it, a multi-split sequence. **The multi-split path does not
+deliver the data.**
+
+Which path is used follows directly from the sample rate:
+
+| Rate | Bytes per frame (stereo, 16-bit) | EHCI path | Result |
+|---|---|---|---|
+| 48000 Hz | 192 | multi-split | silence |
+| 44100 Hz | 176 | single-split | works |
+
+This only matters behind a hub. A full-speed device on an EHCI root port is
+handed to the companion OHCI/UHCI controller and never reaches this code —
+which is why the same card works when plugged in directly.
+
+The failure is silent because isochronous OUT has no handshake: the host
+transmits and never learns whether the device received anything, so nothing
+below the driver can report the loss.
+
+### The workaround
+
+The driver adds 44100 Hz to the rate list it publishes to AHI whenever the
+card does not already declare it. Cards that report the UAC sampling frequency
+control generally honour a `SET_CUR` for 44.1 kHz whether or not they list it.
+
+The rate is offered, not forced: every rate the card declares is still
+available, and the choice stays with the user in AHI Prefs. Selecting 44.1 kHz
+costs nothing on a direct connection.
+
+### Known limitation
+
+The driver **cannot detect that it is behind a hub**, so it cannot make this
+choice automatically. `USBA_HubPort` and `USBA_HubHasMultiTT` are input tags
+for specifying a hub port rather than queryable attributes, and
+`USBA_HCD_Unit` reads the same value in both configurations. A function driver
+therefore has no way to learn that it sits below a transaction translator.
+
+The practical consequence: an application that explicitly requests 48 kHz will
+still be silent behind a hub, because 48 kHz remains a legitimate rate that
+the card declares and the driver has no basis for refusing. Setting AHI's
+mixing frequency to 44.1 kHz covers the normal case, since AHI resamples
+application audio to the mixing rate.
+
+`EHCI-iso-split-bug.md` in the repository root is a write-up of this defect
+intended for the USB stack maintainers.
 
 ## Project structure
 
