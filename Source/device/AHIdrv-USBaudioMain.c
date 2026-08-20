@@ -2527,9 +2527,50 @@ uint32 _usbaudio_AHIsub_Start(struct USBAudioIFace    *Self,
             }
             else
             {
-                DPRINTF("[USBAudio] Start: SET_CUR sample rate OK\n");
                 DPRINTF("[USBAudio] Start: SET_CUR %lu Hz accepted\n",
                         (ULONG)rate);
+            }
+
+            /* Read the rate back.
+             *
+             * Accepting SET_CUR is not the same as honouring it: a card may
+             * answer the request and keep running off its own fixed clock.
+             * That distinction decides whether anything can be done about the
+             * hub problem at all.  If the card really is at 44.1 kHz then
+             * 176 bytes per frame is the true rate and everything downstream
+             * is consistent; if it answers 48000 here it is consuming 48
+             * samples per millisecond regardless of what we asked, no byte
+             * count other than 192 will keep it fed, and no amount of
+             * resampling in the driver can change that. */
+            {
+                uint8  rb[3];
+                int32  rr;
+
+                rb[0] = rb[1] = rb[2] = 0;
+                rr = ILibusb1->libusb_control_transfer(dd->ua_DevHandle,
+                        0xA2,  /* Device-to-Host | Class | Endpoint */
+                        USB_AUDIO_GET_CUR,
+                        USB_AUDIO_SAMPLING_FREQ_CONTROL,
+                        (uint16)dd->ua_EndpointAddr,
+                        rb, 3, 5000);
+
+                if (rr < 0)
+                {
+                    DPRINTF("[USBAudio] Start: GET_CUR sample rate failed (%ld) "
+                            "- cannot confirm the card's actual rate\n", (LONG)rr);
+                }
+                else
+                {
+                    uint32 actual = (uint32)rb[0] |
+                                    ((uint32)rb[1] << 8) |
+                                    ((uint32)rb[2] << 16);
+
+                    DPRINTF("[USBAudio] Start: card reports actual rate %lu Hz "
+                            "(asked for %lu)%s\n",
+                            (ULONG)actual, (ULONG)rate,
+                            (actual == rate) ? "" :
+                            "  *** MISMATCH: card ignored the request ***");
+                }
             }
         }
 

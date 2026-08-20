@@ -552,6 +552,38 @@ uint32 hwUSBPlaySlave(STRPTR *args UNUSED, int32 arglen UNUSED,
                 (ULONG)transfersPerFrame,
                 (ULONG)(dd->ua_DevHandle ? dd->ua_DevHandle->dev->speed : 0));
 
+        /* Topology probe.
+         *
+         * The EHCI multi-split isochronous OUT path is only reached by a
+         * full-speed device sitting behind a high-speed hub; on a root port
+         * such a device is handed to the companion OHCI/UHCI controller
+         * instead.  Deciding anything automatically about the sample rate
+         * needs that distinction, and it is not obvious the stack exposes it.
+         * Log the candidates in both configurations and compare. */
+        {
+            uint32 hubPort  = 0xFFFFFFFF;
+            uint32 multiTT  = 0xFFFFFFFF;
+            uint32 hcdUnit  = 0xFFFFFFFF;
+            uint32 devSpeed = 0xFFFFFFFF;
+
+            if (dd->ua_DevHandle && dd->ua_DevHandle->data &&
+                dd->ua_DevHandle->data->lad_RawFunction)
+            {
+                IUSBSys->USBGetRawFunctionAttrs(
+                    dd->ua_DevHandle->data->lad_RawFunction,
+                    USBA_HubPort,        &hubPort,
+                    USBA_HubHasMultiTT,  &multiTT,
+                    USBA_HCD_Unit,       &hcdUnit,
+                    USBA_DeviceSpeed,    &devSpeed,
+                    TAG_END);
+            }
+
+            DPRINTF("[USBAudio] PlaySlave: topology hubPort=%ld multiTT=%ld "
+                    "hcdUnit=%ld stackSpeed=%ld\n",
+                    (LONG)hubPort, (LONG)multiTT, (LONG)hcdUnit,
+                    (LONG)devSpeed);
+        }
+
         if (cachedFrames < 1)
             cachedFrames = 1;
 
